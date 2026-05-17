@@ -1,6 +1,6 @@
 """
 YourCloser — Telegram Bot Handlers
-High Leverage V4: Beautiful Visuals, Spam Protection, & In-App Seller Onboarding
+Stateless Architecture for Serverless/Scale-to-Zero Deployment
 """
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,17 +22,12 @@ logger = logging.getLogger(__name__)
 
 # ─── Conversation States ─────────────────────────────────────────
 (
-    BROWSE_HOME,
-    VIEW_PRODUCTS,
-    SELECT_SIZE,
-    CART_VIEW,
+    SEARCH_PRODUCT,
     CONFIRM_PROFILE,
     ENTER_NAME,
     ENTER_PHONE,
     ENTER_LOCATION,
     CONFIRM_ORDER,
-    SEARCH_PRODUCT,
-    TRACK_ORDERS,
     ADMIN_HOME,
     ADMIN_BROADCAST,
     ADMIN_ADD_PHOTO,
@@ -41,8 +36,9 @@ logger = logging.getLogger(__name__)
     ADMIN_ADD_CAT,
     ADMIN_ADD_SIZE,
     ADMIN_ADD_PRICE,
-    ADMIN_ADD_QTY
-) = range(20)
+    ADMIN_ADD_QTY,
+    ADMIN_CONFIRM_PROD
+) = range(16)
 
 CATEGORY_EMOJIS = {
     "Shoes": "👟",
@@ -85,7 +81,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         InlineKeyboardButton("📦 Track Orders", callback_data="track_orders")
     ])
     
-    if context.user_data["cart"]:
+    if context.user_data.get("cart"):
         keyboard.append([InlineKeyboardButton(f"🛒 View Cart ({len(context.user_data['cart'])} items)", callback_data="view_cart")])
 
     text = (
@@ -104,22 +100,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-    return BROWSE_HOME
+    return ConversationHandler.END
 
-# ─── Handle Home Menu ────────────────────────────────────────────
-async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── Handle Home Menu (Stateless) ────────────────────────────────
+async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
     
-    if data == "search_mode":
-        await safe_edit(query, "🔍 *What are you looking for?*\n\n_Type the name of the product..._")
-        return SEARCH_PRODUCT
-    elif data == "track_orders":
+    if data == "track_orders":
         orders = db.get_user_orders(query.from_user.id)
         if not orders:
             await safe_edit(query, "You haven't placed any orders yet!", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="nav_home")]]))
-            return TRACK_ORDERS
+            return
             
         text = "📦 *Your Recent Orders*\n\n"
         for o in orders:
@@ -128,9 +121,11 @@ async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text += f"└ Status: {o['status'].title()} | {o['price']:,.0f} ETB\n\n"
             
         await safe_edit(query, text, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="nav_home")]]))
-        return TRACK_ORDERS
+        return
+        
     elif data == "view_cart":
-        return await show_cart(query, context)
+        await show_cart(query, context)
+        return
         
     products, title = [], ""
     if data.startswith("cat_"):
@@ -143,12 +138,18 @@ async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
     if not products:
         await query.answer("Nothing here yet!", show_alert=True)
-        return BROWSE_HOME
+        return
         
     context.user_data.update({"current_list": products, "current_idx": 0, "list_title": title})
-    return await render_product(query, context, edit_current=True)
+    await render_product(query, context, edit_current=True)
 
-# ─── Search Mode ─────────────────────────────────────────────────
+# ─── Search Mode (Stateful) ──────────────────────────────────────
+async def start_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await safe_edit(query, "🔍 *What are you looking for?*\n\n_Type the name of the product..._")
+    return SEARCH_PRODUCT
+
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.message.text.strip()
     if len(q) < 2: return SEARCH_PRODUCT
@@ -160,24 +161,22 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         
     context.user_data.update({"current_list": products, "current_idx": 0, "list_title": f"🔍 Search: {q}"})
     await render_product(update, context, edit_current=False)
-    return VIEW_PRODUCTS
+    return ConversationHandler.END
 
-# ─── Track Orders Handler ────────────────────────────────────────
-async def handle_track_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if query.data == "nav_home": return await start(update, context)
-    return TRACK_ORDERS
+# ─── Beautiful Product Carousel (Stateless) ──────────────────────
+async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit_current: bool) -> None:
+    if "current_list" not in context.user_data or not context.user_data["current_list"]:
+        # Safety catch if container restarted and memory was lost
+        if isinstance(update_or_query, Update) and update_or_query.callback_query:
+            await start(update_or_query, context)
+        return
 
-# ─── Beautiful Product Carousel ──────────────────────────────────
-async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit_current: bool) -> int:
     idx = context.user_data["current_idx"]
     products = context.user_data["current_list"]
     product = products[idx]
     
     sizes = db.get_available_sizes(product["id"])
     
-    # Clean, premium formatting
     caption = f"📍 {context.user_data['list_title']}  ({idx + 1}/{len(products)})\n\n"
     caption += f"✨ *{product['name']}*\n"
     
@@ -189,12 +188,12 @@ async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, ed
         prices = [s["price"] for s in sizes]
         price_display = f"{min(prices):,.0f} ETB" if min(prices) == max(prices) else f"{min(prices):,.0f} - {max(prices):,.0f} ETB"
         caption += f"💰 *Price:*  {price_display}\n"
-        caption += f"📏 *Sizes:*  {', '.join([s['size'] for s in sizes])}\n"
+        caption += f"🏷️ *Options:*  {', '.join([s['size'] for s in sizes])}\n"
     else:
         caption += f"🚫 *Currently Out of Stock*\n"
         
     keyboard = []
-    if sizes: keyboard.append([InlineKeyboardButton("🛒 Select Size to Buy", callback_data=f"buy_{product['id']}")])
+    if sizes: keyboard.append([InlineKeyboardButton("🛒 Select Option to Buy", callback_data=f"buy_{product['id']}")])
         
     nav_row = []
     if len(products) > 1:
@@ -212,8 +211,12 @@ async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, ed
         query = update_or_query
         try:
             if image_url:
-                await query.message.delete()
-                await context.bot.send_photo(chat_id=query.message.chat_id, photo=image_url, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
+                try:
+                    await query.message.delete()
+                    await context.bot.send_photo(chat_id=query.message.chat_id, photo=image_url, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
+                except BadRequest as e:
+                    logger.warning(f"Image load failed: {e}. Falling back to text.")
+                    await context.bot.send_message(chat_id=query.message.chat_id, text=caption, parse_mode="Markdown", reply_markup=reply_markup)
             else:
                 if query.message.photo:
                     await query.message.delete()
@@ -222,23 +225,31 @@ async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, ed
                     await query.edit_message_text(text=caption, parse_mode="Markdown", reply_markup=reply_markup)
         except BadRequest as e:
             logger.error(f"Carousel error: {e}")
-    return VIEW_PRODUCTS
 
-# ─── Carousel Navigation ─────────────────────────────────────────
-async def handle_carousel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── Carousel Navigation (Stateless) ─────────────────────────────
+async def handle_carousel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if query.data == "nav_home": return await start(update, context)
+    
+    if query.data == "nav_home": 
+        await start(update, context)
+        return
         
+    if "current_list" not in context.user_data:
+        await start(update, context)
+        return
+
     idx, total = context.user_data["current_idx"], len(context.user_data["current_list"])
     if query.data == "nav_next": context.user_data["current_idx"] = (idx + 1) % total
     elif query.data == "nav_prev": context.user_data["current_idx"] = (idx - 1) % total
-    elif query.data.startswith("buy_"): return await show_size_selection(query, context, query.data.split("_")[1])
+    elif query.data.startswith("buy_"): 
+        await show_size_selection(query, context, query.data.split("_")[1])
+        return
         
-    return await render_product(query, context, edit_current=True)
+    await render_product(query, context, edit_current=True)
 
-# ─── Size Selection ──────────────────────────────────────────────
-async def show_size_selection(query, context: ContextTypes.DEFAULT_TYPE, product_id: str) -> int:
+# ─── Size Selection (Stateless) ──────────────────────────────────
+async def show_size_selection(query, context: ContextTypes.DEFAULT_TYPE, product_id: str) -> None:
     product = db.get_product_by_id(product_id)
     sizes = db.get_available_sizes(product_id)
     context.user_data.update({"product": product, "product_id": product_id})
@@ -253,20 +264,25 @@ async def show_size_selection(query, context: ContextTypes.DEFAULT_TYPE, product
             row = []
             
     keyboard.append([InlineKeyboardButton("🔙 Back to Product", callback_data="back_to_product")])
-    text = f"✨ *{product['name']}*\n\n👉 *Tap the size you want to add to your cart:*"
+    text = f"✨ *{product['name']}*\n\n👉 *Tap the option you want to add to your cart:*"
     
     if query.message.photo:
         await query.message.delete()
         await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-    return SELECT_SIZE
 
-# ─── Add to Cart ───────────────────────────────────────────────
-async def select_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def select_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if query.data == "back_to_product": return await render_product(query, context, edit_current=True)
+    
+    if query.data == "back_to_product": 
+        await render_product(query, context, edit_current=True)
+        return
+        
+    if "product" not in context.user_data:
+        await start(update, context)
+        return
         
     size = query.data.replace("size_", "")
     product_id = context.user_data.get("product_id")
@@ -274,8 +290,9 @@ async def select_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     stock = db.check_stock(product_id, size)
     
     if not stock:
-        await safe_edit(query, "😔 Sorry, that size just sold out.")
-        return ConversationHandler.END
+        keyboard = [[InlineKeyboardButton("🔙 Browse Other Sizes", callback_data="back_to_product")]]
+        await safe_edit(query, "😔 Sorry, that size just sold out.", InlineKeyboardMarkup(keyboard))
+        return
         
     cart_item = {
         "product_id": product_id, "product_name": product["name"],
@@ -299,26 +316,25 @@ async def select_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         f"Your cart has {len(context.user_data['cart'])} item(s).",
         InlineKeyboardMarkup(keyboard)
     )
-    return CART_VIEW
 
-# ─── Cart View & Actions ─────────────────────────────────────────
-async def handle_cart_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── Cart View & Actions (Stateless) ─────────────────────────────
+async def handle_cart_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     
-    if query.data == "keep_browsing": return await start(update, context)
-    if query.data == "checkout_now": return await start_checkout(query, context)
-    if query.data == "clear_cart":
+    if query.data == "keep_browsing": 
+        await start(update, context)
+    elif query.data == "clear_cart":
         context.user_data["cart"] = []
         await safe_edit(query, "🗑️ Your cart is empty.")
-        return await start(update, context)
-    return CART_VIEW
+        await start(update, context)
 
-async def show_cart(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def show_cart(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     cart = context.user_data.get("cart", [])
     if not cart:
         await query.answer("Your cart is empty!", show_alert=True)
-        return await start(query, context)
+        await start(query, context) # Fallback to start
+        return
         
     text = "🛒 *Your Cart*\n\n"
     total = 0
@@ -339,10 +355,16 @@ async def show_cart(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-    return CART_VIEW
 
-# ─── Checkout Flow ───────────────────────────────────────────────
-async def start_checkout(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── Checkout Flow (Stateful) ────────────────────────────────────
+async def start_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    if not context.user_data.get("cart"):
+        await query.answer("Your cart is empty!", show_alert=True)
+        return ConversationHandler.END
+
     profile = db.get_customer_profile(query.from_user.id)
     if profile:
         context.user_data["saved_profile"] = profile
@@ -456,7 +478,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await notify_owner_order(context, data, user, order, item, i+1, len(cart))
     
     await safe_edit(query, f"🎉 *Order Confirmed!*\n\n{len(cart)} item(s) for {total:,.0f} ETB.\nThe boutique will contact you shortly! 🙏")
-    context.user_data.clear()
+    context.user_data.pop("cart", None)
     return ConversationHandler.END
 
 async def notify_owner_order(context: ContextTypes.DEFAULT_TYPE, data: dict, user, order: dict, item: dict, idx: int, total_items: int) -> None:
@@ -535,15 +557,12 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"✅ Delivered to {success}/{len(customers)} customers.")
     return ConversationHandler.END
 
-# ─── Telegram-Native Seller Onboarding Flow ──────────────────────
 async def admin_add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message.photo:
         await update.message.reply_text("⚠️ Please send a PHOTO (not a file or text).")
         return ADMIN_ADD_PHOTO
-    # Telegram provides multiple sizes, [-1] is the highest resolution.
     file_id = update.message.photo[-1].file_id
     context.user_data["admin_new_prod"] = {"image_url": file_id}
-    
     await update.message.reply_text("✨ *Great photo!*\n\nWhat is the Product Name?\n_(e.g. Nike Dunk Low Panda)_", parse_mode="Markdown")
     return ADMIN_ADD_NAME
 
@@ -554,7 +573,6 @@ async def admin_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def admin_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["admin_new_prod"]["desc"] = update.message.text.strip()
-    
     keyboard = [
         [InlineKeyboardButton("👟 Shoes", callback_data="cat_Shoes"), InlineKeyboardButton("👕 Hoodies", callback_data="cat_Hoodies")],
         [InlineKeyboardButton("💻 Tech", callback_data="cat_Tech"), InlineKeyboardButton("🧢 Accessories", callback_data="cat_Accessories")]
@@ -567,8 +585,7 @@ async def admin_add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.answer()
     cat = query.data.split("_")[1]
     context.user_data["admin_new_prod"]["category"] = cat
-    
-    await safe_edit(query, "📏 *Sizes*\n\nEnter all available sizes separated by commas:\n_(e.g. 40, 41, 42)_")
+    await safe_edit(query, "🏷️ *Options/Variants*\n\nEnter all available options separated by commas:\n_(e.g. M, L, XL OR 128GB, 256GB)_")
     return ADMIN_ADD_SIZE
 
 async def admin_add_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -577,7 +594,6 @@ async def admin_add_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not sizes:
         await update.message.reply_text("⚠️ Invalid format. Try: 40, 41, 42")
         return ADMIN_ADD_SIZE
-        
     context.user_data["admin_new_prod"]["sizes"] = sizes
     await update.message.reply_text("💰 *Price*\n\nWhat is the price in ETB for these?\n_(e.g. 4500)_", parse_mode="Markdown")
     return ADMIN_ADD_PRICE
@@ -587,7 +603,6 @@ async def admin_add_price(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except ValueError:
         await update.message.reply_text("⚠️ Please enter a number only.")
         return ADMIN_ADD_PRICE
-        
     context.user_data["admin_new_prod"]["price"] = price
     await update.message.reply_text("📦 *Quantity*\n\nHow many do you have in stock per size?\n_(e.g. 5)_", parse_mode="Markdown")
     return ADMIN_ADD_QTY
@@ -598,14 +613,48 @@ async def admin_add_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("⚠️ Please enter a whole number.")
         return ADMIN_ADD_QTY
         
+    context.user_data["admin_new_prod"]["qty"] = qty
     prod = context.user_data["admin_new_prod"]
     
-    # Insert to Database!
+    text = (
+        f"📋 *Confirm New Product*\n\n"
+        f"✨ *Name:* {prod['name']}\n"
+        f"📝 *Desc:* {prod['desc']}\n"
+        f"🏷️ *Category:* {prod['category']}\n"
+        f"🏷️ *Options:* {', '.join(prod['sizes'])}\n"
+        f"💰 *Price:* {prod['price']:,.0f} ETB\n"
+        f"📦 *Quantity/Size:* {qty}\n\n"
+        f"Ready to publish?"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Publish Now", callback_data="admin_prod_publish")],
+        [InlineKeyboardButton("❌ Cancel & Restart", callback_data="admin_prod_cancel")]
+    ]
+    
+    await update.message.reply_photo(
+        photo=prod["image_url"],
+        caption=text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_CONFIRM_PROD
+
+async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "admin_prod_cancel":
+        await safe_edit(query, "❌ Product creation cancelled. Type /admin to start again.")
+        context.user_data.pop("admin_new_prod", None)
+        return ConversationHandler.END
+        
+    prod = context.user_data["admin_new_prod"]
     product_id = db.add_product(prod["name"], prod["desc"], prod["category"], prod["image_url"])
     for s in prod["sizes"]:
-        db.add_stock(product_id, s, qty, prod["price"])
+        db.add_stock(product_id, s, prod["qty"], prod["price"])
         
-    await update.message.reply_text(f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in the store.", parse_mode="Markdown")
+    await safe_edit(query, f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in the {prod['category']} store.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close Admin", callback_data="admin_close")]]))
     context.user_data.pop("admin_new_prod", None)
     return ConversationHandler.END
 
@@ -621,7 +670,38 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_bot_app() -> Application:
     app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).request(HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)).build()
     
-    # Admin Conv
+    # 1. Global Stateless Handlers (Guaranteed to work regardless of container resets)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_home_menu, pattern=r"^(cat_.*|new_arrivals|view_cart|track_orders)$"))
+    app.add_handler(CallbackQueryHandler(handle_carousel, pattern=r"^(nav_next|nav_prev|buy_.*|nav_home)$"))
+    app.add_handler(CallbackQueryHandler(select_size, pattern=r"^(size_.*|back_to_product)$"))
+    app.add_handler(CallbackQueryHandler(handle_cart_view, pattern=r"^(keep_browsing|clear_cart)$"))
+
+    # 2. Search Conversation
+    search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_search, pattern=r"^search_mode$")],
+        states={SEARCH_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)]},
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        per_user=True, per_chat=True,
+    )
+    app.add_handler(search_conv)
+
+    # 3. Checkout Conversation
+    checkout_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_checkout, pattern=r"^checkout_now$")],
+        states={
+            CONFIRM_PROFILE: [CallbackQueryHandler(confirm_profile)],
+            ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
+            ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
+            ENTER_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_location)],
+            CONFIRM_ORDER: [CallbackQueryHandler(confirm_order)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        per_user=True, per_chat=True,
+    )
+    app.add_handler(checkout_conv)
+
+    # 4. Admin Conversation
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_start)],
         states={
@@ -634,33 +714,13 @@ def build_bot_app() -> Application:
             ADMIN_ADD_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_size)],
             ADMIN_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_price)],
             ADMIN_ADD_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_qty)],
+            ADMIN_CONFIRM_PROD: [CallbackQueryHandler(admin_confirm_prod)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True, per_chat=True,
     )
     app.add_handler(admin_conv)
     
-    # Shopping Conv
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            BROWSE_HOME: [CallbackQueryHandler(handle_home_menu)],
-            SEARCH_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)],
-            TRACK_ORDERS: [CallbackQueryHandler(handle_track_orders)],
-            VIEW_PRODUCTS: [CallbackQueryHandler(handle_carousel)],
-            SELECT_SIZE: [CallbackQueryHandler(select_size)],
-            CART_VIEW: [CallbackQueryHandler(handle_cart_view)],
-            CONFIRM_PROFILE: [CallbackQueryHandler(confirm_profile)],
-            ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
-            ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
-            ENTER_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_location)],
-            CONFIRM_ORDER: [CallbackQueryHandler(confirm_order)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
-        per_user=True, per_chat=True,
-    )
-    app.add_handler(conv_handler)
-    
     app.add_handler(CallbackQueryHandler(owner_action, pattern=r"^owner_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, fallback))
     return app
