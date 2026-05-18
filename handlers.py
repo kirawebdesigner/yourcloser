@@ -3,6 +3,7 @@ YourCloser — Telegram Bot Handlers
 Stateless Architecture for Serverless/Scale-to-Zero Deployment
 """
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -12,6 +13,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
+    PicklePersistence
 )
 from telegram.error import BadRequest
 from telegram.request import HTTPXRequest
@@ -116,7 +118,7 @@ async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
         text = "📦 *Your Recent Orders*\n\n"
         for o in orders:
-            status_emoji = "⏳" if o['status'] == 'pending' else "✅" if o['status'] == 'confirmed' else "❌"
+            status_emoji = {"pending": "⏳", "confirmed": "✅", "on_way": "🚚", "delivered": "📦", "cancelled": "❌"}.get(o['status'], "❓")
             text += f"{status_emoji} *{o['product_name']}* (Size {o['size']})\n"
             text += f"└ Status: {o['status'].title()} | {o['price']:,.0f} ETB\n\n"
             
@@ -452,32 +454,49 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await safe_edit(query, "👤 *Let's re-enter your details.*\n\nWhat is your full name?")
         return ENTER_NAME
         
+    # ANTI-SPAM / IDEMPOTENCY: Immediately remove buttons so user cannot double-tap while processing
+    await safe_edit(query, "⏳ *Processing your order...*", None)
+    
     data = context.user_data
     user = update.effective_user
     cart = data.get("cart", [])
     
     out_of_stock = []
+    # FINAL ATOMIC-STYLE CHECK
     for item in cart:
         stock = db.check_stock(item["product_id"], item["size"])
-        if not stock: out_of_stock.append(item["product_name"])
+        if not stock or stock["quantity"] <= 0: out_of_stock.append(item["product_name"])
             
     if out_of_stock:
-        await safe_edit(query, f"⚠️ Oops! {', '.join(out_of_stock)} just sold out.\nPlease clear your cart and try again.")
+        await safe_edit(query, f"⚠️ Oops! {', '.join(out_of_stock)} just sold out while you were checking out.\nPlease clear your cart and try again.")
         return ConversationHandler.END
 
     total = 0
+    success_count = 0
     for i, item in enumerate(cart):
         stock = db.check_stock(item["product_id"], item["size"])
+        if not stock or stock["quantity"] <= 0:
+            logger.warning(f"Stock conflict during creation for {item['product_name']}")
+            continue # Skip this item if it sold out in the microsecond between checks
+            
         order = db.create_order(
             product_id=item["product_id"], product_name=item["product_name"], size=item["size"], price=item["price"],
             customer_name=data["customer_name"], customer_phone=data["customer_phone"], delivery_location=data["delivery_location"],
             telegram_user_id=user.id, telegram_username=user.username,
         )
+        
+        # Decrement stock and log
         db.decrement_stock(item["stock_id"], stock["quantity"])
+        logger.info(f"ORDER PLACED: {user.id} bought {item['product_name']} - Stock remaining: {stock['quantity'] - 1}")
+        
         total += item["price"]
+        success_count += 1
         await notify_owner_order(context, data, user, order, item, i+1, len(cart))
     
-    await safe_edit(query, f"🎉 *Order Confirmed!*\n\n{len(cart)} item(s) for {total:,.0f} ETB.\nThe boutique will contact you shortly! 🙏")
+    if success_count > 0:
+        await safe_edit(query, f"🎉 *Order Confirmed!*\n\n{success_count} item(s) for {total:,.0f} ETB.\nThe boutique will contact you shortly! 🙏")
+    else:
+        await safe_edit(query, "❌ Your order could not be completed due to stock conflicts.")
     context.user_data.pop("cart", None)
     return ConversationHandler.END
 
@@ -496,9 +515,29 @@ async def owner_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if str(query.from_user.id) != settings.TELEGRAM_OWNER_CHAT_ID: return await query.answer("⚠️ Owner only.", show_alert=True)
     parts = query.data.split("_")
     action, order_id = parts[1], "_".join(parts[2:])
-    status = "confirmed" if action == "confirm" else "cancelled"
-    db.update_order_status(order_id, status)
-    await safe_edit(query, query.message.text + f"\n\n{'✅' if action=='confirm' else '❌'} *{status.upper()}*")
+    
+    if action == "confirm":
+        db.update_order_status(order_id, "confirmed")
+        text = query.message.text + "\n\n✅ *CONFIRMED*"
+        keyboard = [[
+            InlineKeyboardButton("🚚 Mark On Way", callback_data=f"owner_onway_{order_id}"),
+            InlineKeyboardButton("📦 Mark Delivered", callback_data=f"owner_delivered_{order_id}")
+        ], [InlineKeyboardButton("❌ Cancel Order", callback_data=f"owner_reject_{order_id}")]]
+        await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    elif action == "reject":
+        db.update_order_status(order_id, "cancelled")
+        base_text = query.message.text.split("\n\n✅")[0].split("\n\n🚚")[0]
+        await safe_edit(query, base_text + "\n\n❌ *CANCELLED*")
+    elif action == "onway":
+        db.update_order_status(order_id, "on_way")
+        base_text = query.message.text.split("\n\n✅")[0].split("\n\n🚚")[0]
+        text = base_text + "\n\n🚚 *ON WAY*"
+        keyboard = [[InlineKeyboardButton("📦 Mark Delivered", callback_data=f"owner_delivered_{order_id}")]]
+        await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    elif action == "delivered":
+        db.update_order_status(order_id, "delivered")
+        base_text = query.message.text.split("\n\n✅")[0].split("\n\n🚚")[0]
+        await safe_edit(query, base_text + "\n\n📦 *DELIVERED*")
 
 # ─── Admin Dashboard & Seller Onboarding ─────────────────────────
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -546,15 +585,27 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("No customers yet.")
         return ConversationHandler.END
         
-    await update.message.reply_text(f"🚀 Sending to {len(customers)} customers...")
-    success = 0
-    for uid in customers:
+    await update.message.reply_text(f"🚀 Sending to {len(customers)} customers in the background...")
+    
+    async def send_broadcast():
+        success = 0
+        for uid in customers:
+            try:
+                await context.bot.send_message(chat_id=uid, text=f"📢 *VIP Update:*\n\n{msg}", parse_mode="Markdown")
+                success += 1
+                await asyncio.sleep(0.05)  # Prevent Telegram rate limiting (max 30 msgs/sec)
+            except Exception: pass
+        
         try:
-            await context.bot.send_message(chat_id=uid, text=f"📢 *VIP Update:*\n\n{msg}", parse_mode="Markdown")
-            success += 1
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=f"✅ Broadcast complete! Delivered to {success}/{len(customers)} customers."
+            )
         except Exception: pass
-            
-    await update.message.reply_text(f"✅ Delivered to {success}/{len(customers)} customers.")
+
+    # Run the broadcast in the background so it doesn't block the webhook
+    asyncio.create_task(send_broadcast())
+    
     return ConversationHandler.END
 
 async def admin_add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -574,8 +625,8 @@ async def admin_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def admin_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["admin_new_prod"]["desc"] = update.message.text.strip()
     keyboard = [
-        [InlineKeyboardButton("👟 Shoes", callback_data="cat_Shoes"), InlineKeyboardButton("👕 Hoodies", callback_data="cat_Hoodies")],
-        [InlineKeyboardButton("💻 Tech", callback_data="cat_Tech"), InlineKeyboardButton("🧢 Accessories", callback_data="cat_Accessories")]
+        [InlineKeyboardButton("👟 Shoes", callback_data="admincat_Shoes"), InlineKeyboardButton("👕 Hoodies", callback_data="admincat_Hoodies")],
+        [InlineKeyboardButton("💻 Tech", callback_data="admincat_Tech"), InlineKeyboardButton("🧢 Accessories", callback_data="admincat_Accessories")]
     ]
     await update.message.reply_text("🏷️ *Which category?*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_ADD_CAT
@@ -583,7 +634,7 @@ async def admin_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def admin_add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    cat = query.data.split("_")[1]
+    cat = query.data.replace("admincat_", "")
     context.user_data["admin_new_prod"]["category"] = cat
     await safe_edit(query, "🏷️ *Options/Variants*\n\nEnter all available options separated by commas:\n_(e.g. M, L, XL OR 128GB, 256GB)_")
     return ADMIN_ADD_SIZE
@@ -645,7 +696,13 @@ async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     if query.data == "admin_prod_cancel":
-        await safe_edit(query, "❌ Product creation cancelled. Type /admin to start again.")
+        if query.message.photo:
+            try:
+                await query.message.delete()
+            except Exception: pass
+            await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Product creation cancelled. Type /admin to start again.")
+        else:
+            await safe_edit(query, "❌ Product creation cancelled. Type /admin to start again.")
         context.user_data.pop("admin_new_prod", None)
         return ConversationHandler.END
         
@@ -654,7 +711,17 @@ async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for s in prod["sizes"]:
         db.add_stock(product_id, s, prod["qty"], prod["price"])
         
-    await safe_edit(query, f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in the {prod['category']} store.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close Admin", callback_data="admin_close")]]))
+    text = f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in the {prod['category']} store."
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close Admin", callback_data="admin_close")]])
+    
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception: pass
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await safe_edit(query, text, markup)
+        
     context.user_data.pop("admin_new_prod", None)
     return ConversationHandler.END
 
@@ -665,10 +732,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("💎 Type /start to browse the boutique.")
+    text = (
+        "Sorry 😅 I didn’t understand that.\n\n"
+        "Please choose an option from the menu or type the product name you’re looking for."
+    )
+    await update.message.reply_text(text)
 
 def build_bot_app() -> Application:
-    app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).request(HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)).build()
+    persistence = PicklePersistence(filepath="yourcloser_data.pickle")
+    app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).persistence(persistence).request(HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)).build()
     
     # 1. Global Stateless Handlers (Guaranteed to work regardless of container resets)
     app.add_handler(CommandHandler("start", start))
@@ -683,6 +755,7 @@ def build_bot_app() -> Application:
         states={SEARCH_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)]},
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
         per_user=True, per_chat=True,
+        conversation_timeout=3600
     )
     app.add_handler(search_conv)
 
@@ -698,6 +771,7 @@ def build_bot_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
         per_user=True, per_chat=True,
+        conversation_timeout=3600
     )
     app.add_handler(checkout_conv)
 
@@ -710,14 +784,15 @@ def build_bot_app() -> Application:
             ADMIN_ADD_PHOTO: [MessageHandler(filters.PHOTO, admin_add_photo)],
             ADMIN_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_name)],
             ADMIN_ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_desc)],
-            ADMIN_ADD_CAT: [CallbackQueryHandler(admin_add_cat)],
+            ADMIN_ADD_CAT: [CallbackQueryHandler(admin_add_cat, pattern=r"^admincat_")],
             ADMIN_ADD_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_size)],
             ADMIN_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_price)],
             ADMIN_ADD_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_qty)],
-            ADMIN_CONFIRM_PROD: [CallbackQueryHandler(admin_confirm_prod)],
+            ADMIN_CONFIRM_PROD: [CallbackQueryHandler(admin_confirm_prod, pattern=r"^admin_prod_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True, per_chat=True,
+        conversation_timeout=3600
     )
     app.add_handler(admin_conv)
     

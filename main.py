@@ -21,6 +21,26 @@ logger = logging.getLogger(__name__)
 # ─── Bot Application (global) ────────────────────────────────────
 bot_app = build_bot_app()
 
+async def setup_commands(app_instance):
+    from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    
+    await app_instance.bot.set_my_commands(
+        [BotCommand("start", "Start browsing the boutique")],
+        scope=BotCommandScopeDefault()
+    )
+    
+    if settings.TELEGRAM_OWNER_CHAT_ID:
+        try:
+            await app_instance.bot.set_my_commands(
+                [
+                    BotCommand("start", "Start browsing the boutique"),
+                    BotCommand("admin", "Open boutique command center")
+                ],
+                scope=BotCommandScopeChat(chat_id=settings.TELEGRAM_OWNER_CHAT_ID)
+            )
+        except Exception as e:
+            logger.warning(f"Could not set admin commands: {e}")
+
 
 # ─── Lifespan (startup/shutdown) ─────────────────────────────────
 @asynccontextmanager
@@ -29,6 +49,7 @@ async def lifespan(app: FastAPI):
     settings.validate()
     await bot_app.initialize()
     await bot_app.start()
+    await setup_commands(bot_app)
 
     # Set webhook if URL is configured, otherwise use polling
     if settings.WEBHOOK_URL:
@@ -117,6 +138,7 @@ if __name__ == "__main__":
             polling_app = build_bot_app()
             await polling_app.initialize()
             await polling_app.start()
+            await setup_commands(polling_app)
             await polling_app.bot.delete_webhook()
             await polling_app.updater.start_polling(drop_pending_updates=True)
             logger.info("🚀 YourCloser is online! (Polling mode)")
