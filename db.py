@@ -59,7 +59,7 @@ def get_categories(shop_id: str) -> list[str]:
     )
     if not result.data:
         return []
-    
+
     categories = set(item.get("category", "Uncategorized") for item in result.data if item.get("category"))
     return sorted(list(categories))
 
@@ -252,7 +252,7 @@ def decrement_stock_atomic(stock_id: str, shop_id: str) -> Optional[dict]:
     )
     if not stock_res.data:
         return None
-        
+
     result = client.rpc("decrement_stock_atomic", {"stock_id": stock_id}).execute()
     if result.data and len(result.data) > 0:
         return result.data[0] if isinstance(result.data, list) else result.data
@@ -340,7 +340,7 @@ def get_fulfilled_today_count(shop_id: str) -> int:
     # Get the start of today in UTC
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     iso_start = today_start.isoformat()
-    
+
     result = (
         client.table("orders")
         .select("id", count="exact")
@@ -372,14 +372,14 @@ def get_stats(shop_id: str) -> dict:
     """Get basic sales statistics for the specified shop."""
     client = get_client()
     result = client.table("orders").select("status, price").eq("shop_id", shop_id).execute()
-    
+
     stats = {
         "total_orders": 0,
         "pending": 0,
         "confirmed": 0,
         "revenue": 0.0
     }
-    
+
     if result.data:
         for row in result.data:
             stats["total_orders"] += 1
@@ -388,7 +388,7 @@ def get_stats(shop_id: str) -> dict:
             elif row["status"] == "confirmed":
                 stats["confirmed"] += 1
                 stats["revenue"] += float(row["price"])
-                
+
     return stats
 
 
@@ -421,3 +421,44 @@ def add_stock(product_id: str, size: str, quantity: int, price: float, shop_id: 
         "price": price
     }
     client.table("stock").insert(data).execute()
+
+
+def get_shop_details(shop_id: str) -> Optional[dict]:
+    """Retrieve shop profile and branding details, falling back to default values if not found."""
+    client = get_client()
+    try:
+        result = client.table("shops").select("*").eq("id", shop_id).single().execute()
+        if result.data:
+            return result.data
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching shop details for '{shop_id}': {e}")
+
+    # Fallback to hardcoded default values
+    return {
+        "id": shop_id,
+        "name": "YourCloser" if shop_id == "default" else f"{shop_id.capitalize()} Store",
+        "welcome_text": "Your premium 24/7 boutique assistant.",
+        "support_link": None,
+        "delivery_text": None,
+        "theme_emoji": "💎",
+        "is_verified": False
+    }
+
+
+def get_product_by_id_global(product_id: str) -> Optional[dict]:
+    """Retrieve a single product by its ID globally across all shops (used for tenant resolution from deep links)."""
+    client = get_client()
+    try:
+        result = (
+            client.table("products")
+            .select("id, name, description, image_url, category, shop_id")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
+        return result.data
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error fetching product globally for id '{product_id}': {e}")
+        return None

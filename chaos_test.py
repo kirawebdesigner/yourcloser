@@ -305,6 +305,84 @@ async def test_concurrent_locks():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 10: Deep Link Funnel Resolution & Tenant Transition
+# ═══════════════════════════════════════════════════════════════════
+def test_deep_link_funnel():
+    print("\n🧪 Test 10: Deep Link Funnel Resolution & Tenant Transition")
+    import tenant_context
+    from unittest.mock import patch
+
+    fake_product = {
+        "id": "123456",
+        "name": "Super Sneaker",
+        "shop_id": "urbankicks"
+    }
+
+    class FakeUser:
+        id = 42
+        username = "tester"
+
+    class FakeMessage:
+        text = "/start urbankicks_p_123456"
+
+    class FakeUpdate:
+        effective_user = FakeUser()
+        message = FakeMessage()
+        callback_query = None
+
+    class FakeContext:
+        user_data = {}
+        args = None
+
+    # Test 10a: Composite link /start urbankicks_p_123456
+    ctx = FakeContext()
+    shop_id = tenant_context.get_shop_id(FakeUpdate(), ctx)
+    if shop_id == "urbankicks" and ctx.user_data.get("deep_product_id") == "123456":
+        results.ok("Composite deep link resolved shop_id and deep_product_id correctly")
+    else:
+        results.fail("Composite deep link", f"Expected shop_id='urbankicks', got '{shop_id}'; deep_product_id='123456', got '{ctx.user_data.get('deep_product_id')}'")
+
+    # Test 10b: Global link /start p_123456
+    class FakeMessageGlobal:
+        text = "/start p_123456"
+
+    class FakeUpdateGlobal:
+        effective_user = FakeUser()
+        message = FakeMessageGlobal()
+        callback_query = None
+
+    ctx_global = FakeContext()
+    with patch("db.get_product_by_id_global", return_value=fake_product):
+        shop_id_global = tenant_context.get_shop_id(FakeUpdateGlobal(), ctx_global)
+        if shop_id_global == "urbankicks" and ctx_global.user_data.get("deep_product_id") == "123456":
+            results.ok("Global deep link resolved shop_id and deep_product_id correctly")
+        else:
+            results.fail("Global deep link", f"Expected shop_id='urbankicks', got '{shop_id_global}'; deep_product_id='123456', got '{ctx_global.user_data.get('deep_product_id')}'")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 11: White-label Branding Integration
+# ═══════════════════════════════════════════════════════════════════
+def test_whitelabel_branding():
+    print("\n🧪 Test 11: White-label Branding Integration")
+    import db
+
+    # 1. Test fallback / default shop details
+    details_default = db.get_shop_details("default")
+    if details_default and details_default.get("name") == "YourCloser" and details_default.get("theme_emoji") == "💎":
+        results.ok("Default shop branding loaded correctly")
+    else:
+        results.fail("Default shop branding", f"Loaded incorrect details: {details_default}")
+
+    # 2. Test fallback details for other stores (dynamic defaults)
+    details_other = db.get_shop_details("randomstore")
+    if details_other and details_other.get("name") == "Randomstore Store" and details_other.get("theme_emoji") == "💎":
+        results.ok("Random store fallback branding loaded correctly")
+    else:
+        results.fail("Random store fallback branding", f"Loaded incorrect details: {details_other}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════
 def main():
@@ -321,6 +399,8 @@ def main():
     test_tenant_context()
     test_handler_db_calls()
     asyncio.run(test_concurrent_locks())
+    test_deep_link_funnel()
+    test_whitelabel_branding()
 
     success = results.summary()
     sys.exit(0 if success else 1)

@@ -33,6 +33,35 @@ def get_shop_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
             if len(parts) > 1:
                 arg = parts[1].strip()
                 if arg:
+                    resolved_shop_id = None
+                    product_id = None
+
+                    if "_p_" in arg:
+                        # Format: <shop_id>_p_<product_uuid>
+                        shop_part, prod_part = arg.split("_p_", 1)
+                        if shop_part and prod_part:
+                            resolved_shop_id = shop_part.strip()
+                            product_id = prod_part.strip()
+                    elif arg.startswith("p_"):
+                        # Format: p_<product_uuid>
+                        product_id = arg[2:].strip()
+                        import db
+                        prod = db.get_product_by_id_global(product_id)
+                        if prod:
+                            resolved_shop_id = prod.get("shop_id", "default")
+
+                    if product_id:
+                        context.user_data["deep_product_id"] = product_id
+                        logger.info(f"Tenant: parsed deep_product_id='{product_id}'")
+
+                    if resolved_shop_id:
+                        context.user_data["shop_id"] = resolved_shop_id
+                        logger.info(
+                            f"Tenant: set shop_id='{resolved_shop_id}' from composite deep link "
+                            f"(user={update.effective_user.id})"
+                        )
+                        return resolved_shop_id
+
                     context.user_data["shop_id"] = arg
                     logger.info(
                         f"Tenant: set shop_id='{arg}' from /start deep link "
@@ -44,6 +73,33 @@ def get_shop_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     if update and update.message and context.args:
         arg = context.args[0].strip()
         if arg:
+            resolved_shop_id = None
+            product_id = None
+
+            if "_p_" in arg:
+                shop_part, prod_part = arg.split("_p_", 1)
+                if shop_part and prod_part:
+                    resolved_shop_id = shop_part.strip()
+                    product_id = prod_part.strip()
+            elif arg.startswith("p_"):
+                product_id = arg[2:].strip()
+                import db
+                prod = db.get_product_by_id_global(product_id)
+                if prod:
+                    resolved_shop_id = prod.get("shop_id", "default")
+
+            if product_id:
+                context.user_data["deep_product_id"] = product_id
+                logger.info(f"Tenant: parsed deep_product_id='{product_id}' from context.args")
+
+            if resolved_shop_id:
+                context.user_data["shop_id"] = resolved_shop_id
+                logger.info(
+                    f"Tenant: set shop_id='{resolved_shop_id}' from composite context.args "
+                    f"(user={update.effective_user.id})"
+                )
+                return resolved_shop_id
+
             context.user_data["shop_id"] = arg
             logger.info(
                 f"Tenant: set shop_id='{arg}' from context.args "

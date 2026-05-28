@@ -1,30 +1,19 @@
 """
-Quick script to run the schema.sql against Supabase via the REST API.
-Run once: python seed_db.py
+Quick helper for Supabase schema setup verification.
+Run once after applying schema.sql in the Supabase SQL Editor: python seed_db.py
 """
-import httpx
 import sys
+from config import settings
 
-SUPABASE_URL = "https://ptbdngvloynyqjodguks.supabase.co"
-SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB0YmRuZ3Zsb3lueXFqb2RndWtzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODk0NjE1NiwiZXhwIjoyMDk0NTIyMTU2fQ.25GDRHPWZIbnH3g16slsR7PajzHkiyTGJkPLDGTu1aM"
+SUPABASE_URL = settings.SUPABASE_URL
+SERVICE_KEY = settings.SUPABASE_SERVICE_KEY
+
+settings.validate()
 
 # Read the SQL file
 with open("schema.sql", "r") as f:
     sql = f.read()
 
-# Split into individual statements to run them separately
-# The Supabase REST SQL endpoint can handle multi-statement SQL
-headers = {
-    "apikey": SERVICE_KEY,
-    "Authorization": f"Bearer {SERVICE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation",
-}
-
-# Use the pg-meta SQL endpoint
-url = f"{SUPABASE_URL}/rest/v1/rpc/exec_sql"
-
-# Actually, let's use the raw SQL endpoint available via supabase-py
 from supabase import create_client
 client = create_client(SUPABASE_URL, SERVICE_KEY)
 
@@ -38,8 +27,7 @@ print("SUPABASE SCHEMA SETUP")
 print("=" * 60)
 print()
 print("Please run the schema.sql file in your Supabase SQL Editor:")
-print(f"  1. Go to: {SUPABASE_URL.replace('.co', '.co').replace('https://', 'https://supabase.com/dashboard/project/').split('.')[0]}")
-print(f"  1. Go to: https://supabase.com/dashboard/project/ptbdngvloynyqjodguks/sql/new")
+print("  1. Open your Supabase project SQL Editor")
 print("  2. Paste the contents of schema.sql")
 print("  3. Click 'Run'")
 print()
