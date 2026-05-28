@@ -392,6 +392,47 @@ def get_stats(shop_id: str) -> dict:
     return stats
 
 
+def get_admin_shops(telegram_user_id: str, allow_global_owner_fallback: bool = False) -> list[dict]:
+    """Return shops this Telegram admin can manage."""
+    client = get_client()
+    try:
+        memberships = (
+            client.table("shop_admins")
+            .select("shop_id, role")
+            .eq("telegram_user_id", str(telegram_user_id))
+            .execute()
+        )
+        if memberships.data:
+            roles_by_shop = {row["shop_id"]: row.get("role", "owner") for row in memberships.data if row.get("shop_id")}
+            shop_ids = list(roles_by_shop.keys())
+            shops_res = client.table("shops").select("*").in_("id", shop_ids).order("name").execute()
+            shops = shops_res.data or []
+            for shop in shops:
+                shop["admin_role"] = roles_by_shop.get(shop["id"], "owner")
+            return shops
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching admin shops for '{telegram_user_id}': {e}")
+
+    if allow_global_owner_fallback:
+        try:
+            shops_res = client.table("shops").select("*").order("name").execute()
+            if shops_res.data:
+                for shop in shops_res.data:
+                    shop["admin_role"] = "owner"
+                return shops_res.data
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Error fetching fallback shops: {e}")
+
+    return []
+
+
+def admin_can_manage_shop(telegram_user_id: str, shop_id: str, allow_global_owner_fallback: bool = False) -> bool:
+    """Check whether the Telegram admin is allowed to manage a shop."""
+    return any(shop.get("id") == shop_id for shop in get_admin_shops(telegram_user_id, allow_global_owner_fallback))
+
+
 def add_product(name: str, description: str, category: str, image_url: str, shop_id: str) -> str:
     """Admin function: Create a new product and return its ID."""
     client = get_client()
