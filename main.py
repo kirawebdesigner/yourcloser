@@ -4,6 +4,7 @@ Entry point for the entire application.
 """
 import logging
 import uvicorn
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from telegram import Update
@@ -42,6 +43,79 @@ async def setup_commands(app_instance):
             logger.warning(f"Could not set admin commands: {e}")
 
 
+async def abandoned_cart_recovery_loop(app):
+    """
+    Background loop that runs every 60 seconds.
+    It checks app.user_data for users who:
+    1. Have items in their cart.
+    2. Have not had any activity in the last 30 minutes (1800 seconds).
+    3. Have not been notified yet (recovery_notified == False).
+    """
+    import time
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    logger.info("⏰ Abandoned Cart Recovery loop started")
+    while True:
+        try:
+            await asyncio.sleep(60) # check every minute
+            now = time.time()
+            # Iterate over a copy of the keys to avoid dictionary size change during iteration
+            for user_id, udata in list(app.user_data.items()):
+                cart = udata.get("cart")
+                if not cart:
+                    continue
+                
+                # Check inactivity
+                last_activity = udata.get("last_activity")
+                if not last_activity:
+                    # Initialize last_activity if not present
+                    udata["last_activity"] = now
+                    continue
+                    
+                inactivity_seconds = now - last_activity
+                # If they have been inactive for > 30 minutes (or 1800 seconds) and not notified
+                if inactivity_seconds >= 1800 and not udata.get("recovery_notified", False):
+                    # Flag them so we don't double-notify
+                    udata["recovery_notified"] = True
+                    
+                    # Send friendly reminder!
+                    try:
+                        text = (
+                            "👋 *Hey there!* We noticed you left some premium items in your cart:\n\n"
+                        )
+                        total = 0
+                        for i, item in enumerate(cart):
+                            text += f"▪️ *{item['product_name']}* (Size {item['size']}) — {item['price']:,.0f} ETB\n"
+                            total += item['price']
+                        
+                        text += f"\n💰 *Total: {total:,.0f} ETB*\n\n"
+                        text += "These high-demand items sell out fast! Would you like to complete your order now?"
+                        
+                        keyboard = [
+                            [InlineKeyboardButton("✅ Checkout Now", callback_data="checkout_now")],
+                            [InlineKeyboardButton("🛒 View Cart", callback_data="view_cart")],
+                            [InlineKeyboardButton("🔙 Return to Store", callback_data="nav_home")]
+                        ]
+                        
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text=text,
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                        logger.info(f"✉️ Sent abandoned cart reminder to user {user_id}")
+                        
+                        if app.persistence:
+                            await app.persistence.flush()
+                    except Exception as send_err:
+                        logger.error(f"Failed to send recovery message to {user_id}: {send_err}")
+        except asyncio.CancelledError:
+            logger.info("⏰ Abandoned Cart Recovery loop stopped")
+            break
+        except Exception as e:
+            logger.error(f"Error in abandoned cart recovery loop: {e}")
+
+
 # ─── Lifespan (startup/shutdown) ─────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +124,9 @@ async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
     await setup_commands(bot_app)
+
+    # Start the Abandoned Cart Recovery background loop
+    recovery_task = asyncio.create_task(abandoned_cart_recovery_loop(bot_app))
 
     # Set webhook if URL is configured, otherwise use polling
     if settings.WEBHOOK_URL:
@@ -63,6 +140,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    recovery_task.cancel()
+    try:
+        await recovery_task
+    except asyncio.CancelledError:
+        pass
+        
     await bot_app.stop()
     await bot_app.shutdown()
     logger.info("👋 YourCloser shutdown complete")
@@ -139,6 +222,10 @@ if __name__ == "__main__":
             await polling_app.initialize()
             await polling_app.start()
             await setup_commands(polling_app)
+            
+            # Start the background task in polling mode
+            recovery_task = asyncio.create_task(abandoned_cart_recovery_loop(polling_app))
+            
             await polling_app.bot.delete_webhook()
             await polling_app.updater.start_polling(drop_pending_updates=True)
             logger.info("🚀 YourCloser is online! (Polling mode)")
@@ -150,6 +237,11 @@ if __name__ == "__main__":
             except KeyboardInterrupt:
                 pass
             finally:
+                recovery_task.cancel()
+                try:
+                    await recovery_task
+                except asyncio.CancelledError:
+                    pass
                 await polling_app.updater.stop()
                 await polling_app.stop()
                 await polling_app.shutdown()

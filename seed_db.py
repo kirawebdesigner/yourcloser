@@ -50,17 +50,17 @@ print()
 try:
     result = client.table("products").select("id, name").limit(1).execute()
     if result.data:
-        print(f"✅ Connection works! Found {len(result.data)} product(s)")
+        print(f"[SUCCESS] Connection works! Found {len(result.data)} product(s)")
         for p in result.data:
             print(f"   - {p['name']}")
     else:
-        print("⚠️  Connection works but no products found.")
-        print("   → Run schema.sql in the SQL Editor first!")
+        print("[WARNING] Connection works but no products found.")
+        print("   -> Run schema.sql in the SQL Editor first!")
 except Exception as e:
     error_msg = str(e)
     if "does not exist" in error_msg or "relation" in error_msg:
-        print("⚠️  'products' table doesn't exist yet.")
-        print("   → Run schema.sql in the SQL Editor first!")
+        print("[WARNING] 'products' table doesn't exist yet.")
+        print("   -> Run schema.sql in the SQL Editor first!")
     else:
-        print(f"❌ Connection error: {e}")
+        print(f"[ERROR] Connection error: {e}")
         sys.exit(1)
