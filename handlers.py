@@ -153,8 +153,14 @@ def parse_product_text(text: str) -> dict:
     ADMIN_ADD_SIZE,
     ADMIN_ADD_PRICE,
     ADMIN_ADD_QTY,
-    ADMIN_CONFIRM_PROD
-) = range(17)
+    ADMIN_CONFIRM_PROD,
+    SHOP_CREATE_NAME,
+    SHOP_CREATE_DELIVERY,
+    SHOP_CREATE_SUPPORT,
+    SHOP_CREATE_EMOJI,
+    SHOP_CREATE_WELCOME,
+    SHOP_CREATE_CONFIRM
+) = range(23)
 
 CATEGORY_EMOJIS = {
     "Shoes": "👟",
@@ -166,6 +172,11 @@ CATEGORY_EMOJIS = {
 
 def get_emoji_for_category(cat: str) -> str:
     return CATEGORY_EMOJIS.get(cat, "📦")
+
+def slugify_shop_id(name: str) -> str:
+    """Create a Telegram deep-link-safe shop id from the display name."""
+    slug = re.sub(r"[^a-z0-9]+", "", name.lower())
+    return slug[:32] or "shop"
 
 async def safe_edit(query, text, markup=None, parse_mode="Markdown"):
     """Error handling: ignore duplicate taps that cause 'Message is not modified'"""
@@ -1340,6 +1351,146 @@ async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("admin_new_prod", None)
     return ConversationHandler.END
 
+
+# ─── Shop Setup Wizard ───────────────────────────────────────────
+async def create_shop_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Telegram-native boutique setup flow."""
+    if str(update.effective_user.id) != settings.TELEGRAM_OWNER_CHAT_ID:
+        await update.message.reply_text("⚠️ Owner only.")
+        return ConversationHandler.END
+
+    context.user_data["new_shop"] = {}
+    await update.message.reply_text(
+        "🏪 *Create New Boutique*\n\n"
+        "What is the shop name?\n"
+        "_Example: UrbanKicks Addis_",
+        parse_mode="Markdown"
+    )
+    return SHOP_CREATE_NAME
+
+
+async def create_shop_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("Please enter a real shop name.")
+        return SHOP_CREATE_NAME
+
+    shop_id = slugify_shop_id(name)
+    context.user_data["new_shop"] = {
+        "id": shop_id,
+        "name": name,
+    }
+    await update.message.reply_text(
+        f"`shop_id` will be: `{shop_id}`\n\n"
+        "🚚 Delivery text?\n"
+        "_Example: Same-day delivery in Addis Ababa: 200 ETB._\n\n"
+        "Type `skip` if you do not want to show delivery text.",
+        parse_mode="Markdown"
+    )
+    return SHOP_CREATE_DELIVERY
+
+
+async def create_shop_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["new_shop"]["delivery_text"] = None if text.lower() == "skip" else text
+    await update.message.reply_text(
+        "💬 Support link?\n"
+        "_Example: https://t.me/your_support_username_\n\n"
+        "Type `skip` if you do not have one.",
+        parse_mode="Markdown"
+    )
+    return SHOP_CREATE_SUPPORT
+
+
+async def create_shop_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["new_shop"]["support_link"] = None if text.lower() == "skip" else text
+    await update.message.reply_text(
+        "Choose one theme emoji for this boutique.\n"
+        "_Example: 👟, 👜, 👕, 💄, 🏪_",
+        parse_mode="Markdown"
+    )
+    return SHOP_CREATE_EMOJI
+
+
+async def create_shop_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    emoji = update.message.text.strip()
+    context.user_data["new_shop"]["theme_emoji"] = emoji[:4] if emoji else "🏪"
+    await update.message.reply_text(
+        "Welcome text?\n"
+        "_Example: Premium sneaker boutique. New drops every week._",
+        parse_mode="Markdown"
+    )
+    return SHOP_CREATE_WELCOME
+
+
+async def create_shop_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    welcome = update.message.text.strip()
+    shop = context.user_data["new_shop"]
+    shop["welcome_text"] = welcome or "Browse products and order directly here."
+
+    text = (
+        "📋 *Confirm Boutique Setup*\n\n"
+        f"🏪 *Name:* {shop['name']}\n"
+        f"🔗 *Shop ID:* `{shop['id']}`\n"
+        f"{shop.get('theme_emoji', '🏪')} *Emoji:* {shop.get('theme_emoji', '🏪')}\n"
+        f"🚚 *Delivery:* {shop.get('delivery_text') or 'Not shown'}\n"
+        f"💬 *Support:* {shop.get('support_link') or 'Not shown'}\n"
+        f"👋 *Welcome:* {shop['welcome_text']}\n\n"
+        "Create this boutique?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✅ Create Boutique", callback_data="shop_create_yes")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="shop_create_no")]
+    ]
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SHOP_CREATE_CONFIRM
+
+
+async def create_shop_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if str(query.from_user.id) != settings.TELEGRAM_OWNER_CHAT_ID:
+        await query.answer("⚠️ Owner only.", show_alert=True)
+        return ConversationHandler.END
+
+    if query.data == "shop_create_no":
+        context.user_data.pop("new_shop", None)
+        await safe_edit(query, "❌ Boutique setup cancelled.")
+        return ConversationHandler.END
+
+    shop = context.user_data.get("new_shop", {})
+    if not shop:
+        await safe_edit(query, "Setup expired. Type /create_shop to start again.")
+        return ConversationHandler.END
+
+    db.upsert_shop(
+        shop_id=shop["id"],
+        name=shop["name"],
+        welcome_text=shop["welcome_text"],
+        support_link=shop.get("support_link"),
+        delivery_text=shop.get("delivery_text"),
+        theme_emoji=shop.get("theme_emoji", "🏪"),
+        is_verified=False,
+    )
+    db.assign_shop_admin(shop["id"], str(query.from_user.id), "owner")
+    context.user_data["active_admin_shop_id"] = shop["id"]
+    context.user_data.pop("new_shop", None)
+
+    bot_username = context.bot.username or "YourCloserBot"
+    store_link = f"https://t.me/{bot_username}?start={shop['id']}"
+    text = (
+        f"🎉 *Boutique Created!*\n\n"
+        f"🏪 *{shop['name']}*\n"
+        f"`shop_id: {shop['id']}`\n\n"
+        f"Customer link:\n{store_link}\n\n"
+        "You can now use /admin, select this boutique, and add products."
+    )
+    await safe_edit(query, text)
+    return ConversationHandler.END
+
+
 # ─── Boilerplate ─────────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -1391,6 +1542,22 @@ def build_bot_app() -> Application:
     app.add_handler(checkout_conv)
 
     # 4. Admin Conversation
+    create_shop_conv = ConversationHandler(
+        entry_points=[CommandHandler("create_shop", create_shop_start)],
+        states={
+            SHOP_CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_name)],
+            SHOP_CREATE_DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_delivery)],
+            SHOP_CREATE_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_support)],
+            SHOP_CREATE_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_emoji)],
+            SHOP_CREATE_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_welcome)],
+            SHOP_CREATE_CONFIRM: [CallbackQueryHandler(create_shop_confirm, pattern=r"^shop_create_")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True, per_chat=True,
+        conversation_timeout=3600
+    )
+    app.add_handler(create_shop_conv)
+
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_start)],
         states={

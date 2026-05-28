@@ -433,6 +433,42 @@ def admin_can_manage_shop(telegram_user_id: str, shop_id: str, allow_global_owne
     return any(shop.get("id") == shop_id for shop in get_admin_shops(telegram_user_id, allow_global_owner_fallback))
 
 
+def upsert_shop(
+    shop_id: str,
+    name: str,
+    welcome_text: str,
+    support_link: Optional[str],
+    delivery_text: Optional[str],
+    theme_emoji: str,
+    is_verified: bool = False,
+) -> dict:
+    """Create or update a shop branding profile."""
+    client = get_client()
+    data = {
+        "id": shop_id,
+        "name": name,
+        "welcome_text": welcome_text,
+        "support_link": support_link,
+        "delivery_text": delivery_text,
+        "theme_emoji": theme_emoji,
+        "is_verified": is_verified,
+    }
+    result = client.table("shops").upsert(data, on_conflict="id").execute()
+    return result.data[0] if result.data else data
+
+
+def assign_shop_admin(shop_id: str, telegram_user_id: str, role: str = "owner") -> dict:
+    """Grant a Telegram user admin access to a shop."""
+    client = get_client()
+    data = {
+        "shop_id": shop_id,
+        "telegram_user_id": str(telegram_user_id),
+        "role": role,
+    }
+    result = client.table("shop_admins").upsert(data, on_conflict="shop_id,telegram_user_id").execute()
+    return result.data[0] if result.data else data
+
+
 def add_product(name: str, description: str, category: str, image_url: str, shop_id: str) -> str:
     """Admin function: Create a new product and return its ID."""
     client = get_client()

@@ -35,7 +35,8 @@ async def setup_commands(app_instance):
             await app_instance.bot.set_my_commands(
                 [
                     BotCommand("start", "Start browsing the boutique"),
-                    BotCommand("admin", "Open boutique command center")
+                    BotCommand("admin", "Open boutique command center"),
+                    BotCommand("create_shop", "Create a new boutique")
                 ],
                 scope=BotCommandScopeChat(chat_id=settings.TELEGRAM_OWNER_CHAT_ID)
             )
