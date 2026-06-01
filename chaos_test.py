@@ -17,12 +17,12 @@ class TestResult:
 
     def ok(self, name):
         self.passed += 1
-        print(f"  ✅ {name}")
+        print(f"  [OK] {name}")
 
     def fail(self, name, reason):
         self.failed += 1
         self.errors.append((name, reason))
-        print(f"  ❌ {name}: {reason}")
+        print(f"  [FAIL] {name}: {reason}")
 
     def summary(self):
         total = self.passed + self.failed
@@ -43,7 +43,7 @@ results = TestResult()
 # TEST 1: Import validation — all modules load without errors
 # ═══════════════════════════════════════════════════════════════════
 def test_imports():
-    print("\n🧪 Test 1: Import Validation")
+    print("\n[TEST 1] Import Validation")
     try:
         import db
         results.ok("db.py imports cleanly")
@@ -73,7 +73,7 @@ def test_imports():
 # TEST 2: Checkout lock (anti-duplicate submission)
 # ═══════════════════════════════════════════════════════════════════
 def test_checkout_lock():
-    print("\n🧪 Test 2: Checkout Lock (Anti-Duplicate Submission)")
+    print("\n[TEST 2] Checkout Lock (Anti-Duplicate Submission)")
     from handlers import acquire_order_lock, release_order_lock
 
     user_id = 12345
@@ -98,7 +98,7 @@ def test_checkout_lock():
 # TEST 3: Rapid-fire spam lock (10x concurrent attempts)
 # ═══════════════════════════════════════════════════════════════════
 def test_spam_lock():
-    print("\n🧪 Test 3: Rapid-Fire Spam Lock (10x Concurrent)")
+    print("\n[TEST 3] Rapid-Fire Spam Lock (10x Concurrent)")
     from handlers import acquire_order_lock, release_order_lock
 
     user_id = 99999
@@ -121,7 +121,7 @@ def test_spam_lock():
 # TEST 4: db.py function signatures require shop_id
 # ═══════════════════════════════════════════════════════════════════
 def test_db_signatures():
-    print("\n🧪 Test 4: DB Functions Require Explicit shop_id")
+    print("\n[TEST 4] DB Functions Require Explicit shop_id")
     import inspect
     import db
 
@@ -161,9 +161,9 @@ def test_db_signatures():
             # Check it's not optional with a default
             param = sig.parameters["shop_id"]
             if param.default is inspect.Parameter.empty:
-                results.ok(f"db.{fn_name}() — shop_id is required")
+                results.ok(f"db.{fn_name}() - shop_id is required")
             else:
-                results.fail(f"db.{fn_name}()", f"shop_id has default='{param.default}' — must be required")
+                results.fail(f"db.{fn_name}()", f"shop_id has default='{param.default}' - must be required")
         else:
             results.fail(f"db.{fn_name}()", "Missing shop_id parameter entirely")
 
@@ -172,7 +172,7 @@ def test_db_signatures():
 # TEST 5: Old decrement_stock is REMOVED
 # ═══════════════════════════════════════════════════════════════════
 def test_old_decrement_removed():
-    print("\n🧪 Test 5: Old decrement_stock() Removed")
+    print("\n[TEST 5] Old decrement_stock() Removed")
     import db
     import inspect
 
@@ -191,7 +191,7 @@ def test_old_decrement_removed():
 # TEST 6: get_daily_order_count alias exists
 # ═══════════════════════════════════════════════════════════════════
 def test_daily_order_alias():
-    print("\n🧪 Test 6: get_daily_order_count Alias")
+    print("\n[TEST 6] get_daily_order_count Alias")
     import db
 
     if hasattr(db, "get_daily_order_count"):
@@ -207,10 +207,10 @@ def test_daily_order_alias():
 # TEST 7: Tenant context guard returns string
 # ═══════════════════════════════════════════════════════════════════
 def test_tenant_context():
-    print("\n🧪 Test 7: Tenant Context Guard")
+    print("\n[TEST 7] Tenant Context Guard")
     import tenant_context
 
-    # Test with None context — should return "default" without crashing
+    # Test with None context - should return "default" without crashing
     class FakeUpdate:
         effective_user = type("U", (), {"id": 1})()
         message = None
@@ -240,20 +240,19 @@ def test_tenant_context():
 # TEST 8: handlers.py doesn't call non-existent db functions
 # ═══════════════════════════════════════════════════════════════════
 def test_handler_db_calls():
-    print("\n🧪 Test 8: Handler → DB Call Integrity")
+    print("\n[TEST 8] Handler -> DB Call Integrity")
 
     with open("handlers.py", "r", encoding="utf-8") as f:
         source = f.read()
 
     # These function calls should NOT exist in handlers.py
     banned_calls = [
-        "db.decrement_stock(",  # Old non-atomic — should be decrement_stock_atomic
+        "db.decrement_stock(",  # Old non-atomic - should be decrement_stock_atomic
     ]
 
     for call in banned_calls:
         # Make sure it's not calling the old version (but atomic is OK)
         if call in source and "decrement_stock_atomic" not in source.split(call)[0].split("\n")[-1]:
-            # More precise: check if there's a standalone db.decrement_stock( that's NOT db.decrement_stock_atomic(
             import re
             matches = re.findall(r'db\.decrement_stock\((?!atomic)', source)
             if matches:
@@ -281,7 +280,7 @@ def test_handler_db_calls():
 # TEST 9: Concurrent lock stress test (async)
 # ═══════════════════════════════════════════════════════════════════
 async def test_concurrent_locks():
-    print("\n🧪 Test 9: Concurrent Lock Stress Test (Async)")
+    print("\n[TEST 9] Concurrent Lock Stress Test (Async)")
     from handlers import acquire_order_lock, release_order_lock
 
     acquired = []
@@ -297,7 +296,7 @@ async def test_concurrent_locks():
     await asyncio.gather(*tasks)
 
     if len(acquired) == 1:
-        results.ok(f"20 concurrent attempts → only 1 acquired (attempt #{acquired[0]})")
+        results.ok(f"20 concurrent attempts -> only 1 acquired (attempt #{acquired[0]})")
     else:
         results.fail("Concurrent lock", f"Expected 1 acquisition, got {len(acquired)}: {acquired}")
 
@@ -305,10 +304,10 @@ async def test_concurrent_locks():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 10: Deep Link Funnel Resolution & Tenant Transition
+# TEST 10: Deep Funnel Funnel Resolution & Tenant Transition
 # ═══════════════════════════════════════════════════════════════════
 def test_deep_link_funnel():
-    print("\n🧪 Test 10: Deep Link Funnel Resolution & Tenant Transition")
+    print("\n[TEST 10] Deep Link Funnel Resolution & Tenant Transition")
     import tenant_context
     from unittest.mock import patch
 
@@ -364,7 +363,7 @@ def test_deep_link_funnel():
 # TEST 11: White-label Branding Integration
 # ═══════════════════════════════════════════════════════════════════
 def test_whitelabel_branding():
-    print("\n🧪 Test 11: White-label Branding Integration")
+    print("\n[TEST 11] White-label Branding Integration")
     import db
 
     # 1. Test fallback / default shop details
@@ -387,7 +386,7 @@ def test_whitelabel_branding():
 # ═══════════════════════════════════════════════════════════════════
 def main():
     print("=" * 50)
-    print("🔥 YourCloser Chaos Test Suite")
+    print("YourCloser Chaos Test Suite")
     print("=" * 50)
 
     test_imports()

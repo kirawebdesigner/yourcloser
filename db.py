@@ -8,9 +8,15 @@ from typing import Optional
 from datetime import datetime, timezone
 
 
+_client = None
+
+
 def get_client() -> Client:
-    """Create and return a Supabase client using service role key."""
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+    """Create and return a cached Supabase client using service role key."""
+    global _client
+    if _client is None:
+        _client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+    return _client
 
 
 # ─── Product Queries ──────────────────────────────────────────────
@@ -539,3 +545,28 @@ def get_product_by_id_global(product_id: str) -> Optional[dict]:
         import logging
         logging.getLogger(__name__).error(f"Error fetching product globally for id '{product_id}': {e}")
         return None
+
+
+def get_shop_admins(shop_id: str) -> list[str]:
+    """Retrieve all Telegram user IDs of admins/owners assigned to a specific shop."""
+    client = get_client()
+    try:
+        res = client.table("shop_admins").select("telegram_user_id").eq("shop_id", shop_id).execute()
+        return [row["telegram_user_id"] for row in res.data if row.get("telegram_user_id")]
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching admins for shop '{shop_id}': {e}")
+        return []
+
+
+def remove_shop_admin(shop_id: str, telegram_user_id: str) -> bool:
+    """Revoke admin permissions from a Telegram user for a specific shop."""
+    client = get_client()
+    try:
+        client.table("shop_admins").delete().eq("shop_id", shop_id).eq("telegram_user_id", str(telegram_user_id)).execute()
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error removing admin '{telegram_user_id}' from '{shop_id}': {e}")
+        return False
+

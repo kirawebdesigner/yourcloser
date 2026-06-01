@@ -154,13 +154,14 @@ def parse_product_text(text: str) -> dict:
     ADMIN_ADD_PRICE,
     ADMIN_ADD_QTY,
     ADMIN_CONFIRM_PROD,
+    ADMIN_INPUT_OWNER_ID,
     SHOP_CREATE_NAME,
     SHOP_CREATE_DELIVERY,
     SHOP_CREATE_SUPPORT,
     SHOP_CREATE_EMOJI,
     SHOP_CREATE_WELCOME,
     SHOP_CREATE_CONFIRM
-) = range(23)
+) = range(24)
 
 CATEGORY_EMOJIS = {
     "Shoes": "👟",
@@ -434,7 +435,7 @@ async def render_product(update_or_query, context: ContextTypes.DEFAULT_TYPE, ed
 
     caption = f"📍 {context.user_data['list_title']}  ({idx + 1}/{len(products)})\n"
     caption += f"{emoji} *{shop_name}*{verified_badge} | ⚡ *Fast Delivery*\n"
-    caption += f"👀 *{views} people viewed this today* | 🔥 *{orders_placed} ordered recently!*\n"
+    caption += f"💎 *Premium Quality* | ⚡ *Customer Favorite*\n"
     if daily_orders > 0:
         caption += f"✨ *{daily_orders} successful checkouts today!*\n"
     caption += "\n"
@@ -874,7 +875,6 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         release_order_lock(user.id)
 
 async def notify_owner_order(context: ContextTypes.DEFAULT_TYPE, data: dict, user, order: dict, item: dict, idx: int, total_items: int) -> None:
-    if not settings.TELEGRAM_OWNER_CHAT_ID: return
     shop_id = order.get("shop_id", "default")
     keyboard = [[
         InlineKeyboardButton("✅ Confirm", callback_data=f"owner_confirm|{shop_id}|{order['id']}"),
@@ -885,21 +885,43 @@ async def notify_owner_order(context: ContextTypes.DEFAULT_TYPE, data: dict, use
             f"📦 {item['product_name']} (Size {item['size']})\n💰 {item['price']:,.0f} ETB\n\n"
             f"👤 {data['customer_name']}\n📱 {data['customer_phone']}\n📍 {data['delivery_location']}\n"
             f"🆔 @{user.username or user.id}")
-    await context.bot.send_message(chat_id=settings.TELEGRAM_OWNER_CHAT_ID, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # Determine recipients: specific shop admins, otherwise fallback to global owner
+    shop_admins = db.get_shop_admins(shop_id)
+    recipients = [str(r) for r in shop_admins if r]
+    if not recipients and settings.TELEGRAM_OWNER_CHAT_ID:
+        recipients = [str(settings.TELEGRAM_OWNER_CHAT_ID)]
+
+    for recipient in recipients:
+        try:
+            await context.bot.send_message(chat_id=recipient, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e:
+            logger.error(f"Failed to send order notification to admin {recipient}: {e}")
 
 async def owner_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-    if str(query.from_user.id) != settings.TELEGRAM_OWNER_CHAT_ID: return await query.answer("⚠️ Owner only.", show_alert=True)
+    # Answer IMMEDIATELY before any DB work to avoid 10s Telegram timeout
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if "|" in query.data:
         action_part, shop_id, order_id = query.data.split("|", 2)
         action = action_part.replace("owner_", "", 1)
     else:
-        # Backward compatibility for older pending owner notifications.
         parts = query.data.split("_")
         action, order_id = parts[1], "_".join(parts[2:])
         shop_id = tenant_context.get_shop_id(update, context)
+
+    # Authorization Check (DB call AFTER query already answered)
+    user_id = str(query.from_user.id)
+    is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
+    shop_admins = db.get_shop_admins(shop_id)
+    is_shop_admin = user_id in [str(admin_id) for admin_id in shop_admins if admin_id]
+
+    if not (is_global_owner or is_shop_admin):
+        return await query.answer("⚠️ Shop Owner access only.", show_alert=True)
 
     if action == "confirm":
         db.update_order_status(order_id, "confirmed", shop_id)
@@ -925,23 +947,53 @@ async def owner_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_edit(query, base_text + "\n\n📦 *DELIVERED*")
 
 
-async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Owner-only admin command center."""
-    if str(update.effective_user.id) != settings.TELEGRAM_OWNER_CHAT_ID:
-        await update.message.reply_text("⚠️ Owner only.")
+async def admin_entry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fallback entry point to restore admin conversation state if lost after bot restart."""
+    query = update.callback_query
+
+    if not query:
+        return await admin_start(update, context)
+
+    # ✅ ANSWER IMMEDIATELY — before any DB calls — to avoid Telegram 10s timeout
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user_id = str(query.from_user.id)
+    is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
+
+    # Retrieve persistent shop_id from disk cache
+    shop_id = get_active_admin_shop_id(context)
+    if not shop_id:
+        return await admin_start(update, context)
+
+    # Validate authorization (DB call happens AFTER query is already answered)
+    if not db.admin_can_manage_shop(user_id, shop_id, allow_global_owner_fallback=True) and not is_global_owner:
+        await safe_edit(query, "⚠️ You are not assigned to this boutique.")
         return ConversationHandler.END
+
+    # Reroute to admin_home to process the button click
+    return await admin_home(update, context)
+
+
+async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin command center."""
+    user_id = str(update.effective_user.id)
+    is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
 
     shops = db.get_admin_shops(
-        str(update.effective_user.id),
+        user_id,
         allow_global_owner_fallback=True
     )
-    if not shops:
-        await update.message.reply_text(
-            "No boutiques are assigned to this admin yet.\n\n"
-            "Run migration_v7.sql, then add this Telegram user to shop_admins."
-        )
-        return ConversationHandler.END
-
+    
+    text_error = (
+        "⚠️ Admin only.\n\n"
+        "You are not assigned to manage any boutiques yet."
+    )
+    
+    text_select = "🏪 *Select Boutique*\n\nChoose the shop you want to manage:"
+    
     keyboard = []
     for shop in shops:
         emoji = shop.get("theme_emoji", "🏪")
@@ -949,11 +1001,17 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         keyboard.append([InlineKeyboardButton(f"{emoji} {name}", callback_data=f"admin_shop_{shop['id']}")])
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="admin_close")])
 
-    await update.message.reply_text(
-        "🏪 *Select Boutique*\n\nChoose the shop you want to manage:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if not shops:
+        if update.callback_query:
+            await update.callback_query.answer(text_error, show_alert=True)
+        else:
+            await update.message.reply_text(text_error)
+        return ConversationHandler.END
+
+    if update.callback_query:
+        await safe_edit(update.callback_query, text_select, InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text_select, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_SELECT_SHOP
 
 
@@ -980,6 +1038,7 @@ async def render_admin_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id:
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("👥 Manage Admins", callback_data="admin_manage_users")],
         [InlineKeyboardButton("🏪 Switch Shop", callback_data="admin_switch_shop")],
         [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
     ]
@@ -987,22 +1046,54 @@ async def render_admin_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id:
     return ADMIN_HOME
 
 
+async def render_admin_management_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
+    """Render the admin/owner management screen for the currently selected shop."""
+    admins = db.get_shop_admins(shop_id)
+    text = (
+        f"👥 *Manage Shop Admins*\n"
+        f"`Shop: {shop_id}`\n\n"
+        f"Admins listed here will receive real-time order alerts for this boutique and can manage its products.\n\n"
+        f"👤 *Current Admins:* \n"
+    )
+    if not admins:
+        text += "⚠️ No specific admins assigned. (Global owner has full access)\n"
+    else:
+        for idx, admin_id in enumerate(admins):
+            text += f"{idx + 1}. `{admin_id}`\n"
+
+    keyboard = []
+    # Add individual revoke buttons for custom admins
+    for admin_id in admins:
+        keyboard.append([
+            InlineKeyboardButton(f"❌ Revoke `{admin_id}`", callback_data=f"admin_revoke_{admin_id}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Add Admin (User ID)", callback_data="admin_add_user")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Panel", callback_data="admin_back_home")])
+    
+    await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    return ADMIN_HOME
+
+
 async def admin_select_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Pin the selected shop for the admin session."""
     query = update.callback_query
-    await query.answer()
+    # Answer IMMEDIATELY before any DB work
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
-    if str(query.from_user.id) != settings.TELEGRAM_OWNER_CHAT_ID:
-        await query.answer("⚠️ Owner only.", show_alert=True)
-        return ConversationHandler.END
+    user_id = str(query.from_user.id)
+    is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
 
     if query.data == "admin_close":
         await safe_edit(query, "Panel closed.")
         return ConversationHandler.END
 
     shop_id = query.data.replace("admin_shop_", "", 1)
-    if not db.admin_can_manage_shop(str(query.from_user.id), shop_id, allow_global_owner_fallback=True):
-        await query.answer("You are not assigned to this boutique.", show_alert=True)
+    if not db.admin_can_manage_shop(user_id, shop_id, allow_global_owner_fallback=True) and not is_global_owner:
+        await safe_edit(query, "⚠️ You are not assigned to this boutique.")
         return ADMIN_SELECT_SHOP
 
     context.user_data["active_admin_shop_id"] = shop_id
@@ -1012,16 +1103,20 @@ async def admin_select_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle admin panel button actions."""
     query = update.callback_query
-    await query.answer()
-    if str(query.from_user.id) != settings.TELEGRAM_OWNER_CHAT_ID:
-        await query.answer("⚠️ Owner only.", show_alert=True)
-        return ConversationHandler.END
+    # Safely answer — may already be answered by admin_entry_callback
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user_id = str(query.from_user.id)
+    is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
 
     if query.data == "admin_close":
         await safe_edit(query, "Panel closed.")
         return ConversationHandler.END
     if query.data == "admin_switch_shop":
-        shops = db.get_admin_shops(str(query.from_user.id), allow_global_owner_fallback=True)
+        shops = db.get_admin_shops(user_id, allow_global_owner_fallback=True)
         keyboard = [
             [InlineKeyboardButton(f"{shop.get('theme_emoji', '🏪')} {shop.get('name', shop['id'])}", callback_data=f"admin_shop_{shop['id']}")]
             for shop in shops
@@ -1034,7 +1129,7 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not shop_id:
         await query.answer("Select a boutique first.", show_alert=True)
         return ADMIN_SELECT_SHOP
-    if not db.admin_can_manage_shop(str(query.from_user.id), shop_id, allow_global_owner_fallback=True):
+    if not db.admin_can_manage_shop(user_id, shop_id, allow_global_owner_fallback=True) and not is_global_owner:
         await query.answer("You are not assigned to this boutique.", show_alert=True)
         return ConversationHandler.END
 
@@ -1044,6 +1139,24 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if query.data == "admin_add_product":
         await safe_edit(query, f"📸 *Add Product*\n\n`Current Shop: {shop_id}`\n\nSend a clear, high-quality photo of the product:")
         return ADMIN_ADD_PHOTO
+
+    # New Admin Management actions
+    if query.data == "admin_manage_users":
+        return await render_admin_management_panel(query, context, shop_id)
+
+    if query.data == "admin_back_home":
+        return await render_admin_panel(query, context, shop_id)
+
+    if query.data == "admin_add_user":
+        await safe_edit(query, "👥 *Add Shop Admin*\n\nPlease enter the new Admin's **Telegram User ID** (a numeric ID like `123456789`):\n\n_To abort this action, type 'cancel'._")
+        return ADMIN_INPUT_OWNER_ID
+
+    if query.data.startswith("admin_revoke_"):
+        admin_to_remove = query.data.replace("admin_revoke_", "")
+        db.remove_shop_admin(shop_id, admin_to_remove)
+        await query.answer(f"Admin {admin_to_remove} revoked successfully!", show_alert=True)
+        return await render_admin_management_panel(query, context, shop_id)
+
 
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message.text
@@ -1086,6 +1199,49 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     asyncio.create_task(send_broadcast())
 
     return ConversationHandler.END
+
+
+async def admin_input_owner_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """State Handler: Receive a Telegram User ID and assign them as a shop admin."""
+    new_admin_id = update.message.text.strip()
+    if new_admin_id.lower() == 'cancel':
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    if not new_admin_id.isdigit():
+        await update.message.reply_text("⚠️ Invalid User ID. It must be a numeric ID (e.g. `123456789`). Please try again or type 'cancel' to abort:")
+        return ADMIN_INPUT_OWNER_ID
+
+    shop_id = get_active_admin_shop_id(context)
+    if not shop_id:
+        await update.message.reply_text("Select a boutique with /admin before adding admins.")
+        return ConversationHandler.END
+
+    db.assign_shop_admin(shop_id, new_admin_id, role="owner")
+    
+    admins = db.get_shop_admins(shop_id)
+    text = (
+        f"✅ *Admin Added Successfully!*\n\n"
+        f"User `{new_admin_id}` is now registered as an admin/owner for `{shop_id}` and will receive order notifications.\n\n"
+        f"👤 *Current Admins:* \n"
+    )
+    for idx, admin_id in enumerate(admins):
+        text += f"{idx + 1}. `{admin_id}`\n"
+
+    keyboard = []
+    # Add individual revoke buttons for custom admins
+    for admin_id in admins:
+        keyboard.append([
+            InlineKeyboardButton(f"❌ Revoke `{admin_id}`", callback_data=f"admin_revoke_{admin_id}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Add Another Admin", callback_data="admin_add_user")])
+    keyboard.append([InlineKeyboardButton("🔙 Manage Admins Menu", callback_data="admin_manage_users")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Panel", callback_data="admin_back_home")])
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_HOME
+
 
 async def admin_add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     shop_id = get_active_admin_shop_id(context)
@@ -1559,7 +1715,10 @@ def build_bot_app() -> Application:
     app.add_handler(create_shop_conv)
 
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_start)],
+        entry_points=[
+            CommandHandler("admin", admin_start),
+            CallbackQueryHandler(admin_entry_callback, pattern=r"^admin_")
+        ],
         states={
             ADMIN_SELECT_SHOP: [CallbackQueryHandler(admin_select_shop, pattern=r"^(admin_shop_.*|admin_close)$")],
             ADMIN_HOME: [CallbackQueryHandler(admin_home)],
@@ -1572,6 +1731,7 @@ def build_bot_app() -> Application:
             ADMIN_ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_price)],
             ADMIN_ADD_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_qty)],
             ADMIN_CONFIRM_PROD: [CallbackQueryHandler(admin_confirm_prod, pattern=r"^admin_prod_")],
+            ADMIN_INPUT_OWNER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input_owner_id)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True, per_chat=True,
