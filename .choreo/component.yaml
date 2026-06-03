@@ -2,6 +2,7 @@ schemaVersion: 1.2
 endpoints:
   - name: ethio-closer-api
     displayName: Ethio Closer API
+    type: REST
     service:
       basePath: /
       port: 8000
