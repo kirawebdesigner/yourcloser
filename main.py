@@ -23,25 +23,20 @@ logger = logging.getLogger(__name__)
 bot_app = build_bot_app()
 
 async def setup_commands(app_instance):
-    from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    from telegram import BotCommand, BotCommandScopeDefault
     
-    await app_instance.bot.set_my_commands(
-        [BotCommand("start", "Start browsing the boutique")],
-        scope=BotCommandScopeDefault()
-    )
-    
-    if settings.TELEGRAM_OWNER_CHAT_ID:
-        try:
-            await app_instance.bot.set_my_commands(
-                [
-                    BotCommand("start", "Start browsing the boutique"),
-                    BotCommand("admin", "Open boutique command center"),
-                    BotCommand("create_shop", "Create a new boutique")
-                ],
-                scope=BotCommandScopeChat(chat_id=settings.TELEGRAM_OWNER_CHAT_ID)
-            )
-        except Exception as e:
-            logger.warning(f"Could not set admin commands: {e}")
+    try:
+        await app_instance.bot.set_my_commands(
+            [
+                BotCommand("start", "Start browsing the boutique"),
+                BotCommand("admin", "Open boutique command center"),
+                BotCommand("create_shop", "Create a new boutique")
+            ],
+            scope=BotCommandScopeDefault()
+        )
+        logger.info("✅ Global commands configured for all users")
+    except Exception as e:
+        logger.warning(f"Could not set default commands: {e}")
 
 
 async def abandoned_cart_recovery_loop(app):
@@ -132,6 +127,12 @@ async def lifespan(app: FastAPI):
     # Set webhook if URL is configured, otherwise use polling
     if settings.WEBHOOK_URL:
         webhook_url = f"{settings.WEBHOOK_URL}/webhook"
+        try:
+            await bot_app.bot.delete_webhook()
+            logger.info("Deleted existing webhook first for auto-recovery")
+        except Exception as e:
+            logger.warning(f"Error deleting old webhook on startup: {e}")
+
         await bot_app.bot.set_webhook(url=webhook_url)
         logger.info(f"✅ Webhook set: {webhook_url}")
     else:
@@ -173,7 +174,20 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    db_status = "ok"
+    try:
+        import db
+        # Quick query check to verify database is alive
+        db.get_fulfilled_today_count("default")
+    except Exception as e:
+        logger.error(f"Health check DB failed: {e}")
+        db_status = f"error: {str(e)}"
+        return Response(
+            content=f'{{"status": "unhealthy", "database": "{db_status}"}}',
+            status_code=500,
+            media_type="application/json"
+        )
+    return {"status": "healthy", "database": "connected"}
 
 
 # ─── Telegram Webhook ────────────────────────────────────────────

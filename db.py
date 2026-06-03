@@ -278,6 +278,7 @@ def create_order(
     telegram_user_id: int,
     shop_id: str,
     telegram_username: Optional[str] = None,
+    parent_order_id: Optional[str] = None,
 ) -> dict:
     """
     Save a new order to the database.
@@ -297,15 +298,33 @@ def create_order(
         "status": "pending",
         "shop_id": shop_id,
     }
+    if parent_order_id:
+        order_data["parent_order_id"] = parent_order_id
     result = client.table("orders").insert(order_data).execute()
     return result.data[0] if result.data else {}
 
 
-def update_order_status(order_id: str, status: str, shop_id: str) -> bool:
-    """Update order status (pending → confirmed → delivered → cancelled) for a specific shop."""
+def update_order_status(order_id_or_parent_id: str, status: str, shop_id: str) -> bool:
+    """Update order status for a specific shop by order ID or parent_order_id."""
     client = get_client()
-    client.table("orders").update({"status": status}).eq("id", order_id).eq("shop_id", shop_id).execute()
+    # Try updating by parent_order_id first
+    result = client.table("orders").update({"status": status}).eq("parent_order_id", order_id_or_parent_id).eq("shop_id", shop_id).execute()
+    if not result.data:
+        # Fallback to single order ID
+        client.table("orders").update({"status": status}).eq("id", order_id_or_parent_id).eq("shop_id", shop_id).execute()
     return True
+
+
+def get_orders_by_id_or_group(order_id_or_parent_id: str, shop_id: str) -> list[dict]:
+    """Retrieve orders by either parent_order_id or individual order ID."""
+    client = get_client()
+    # Try parent_order_id first
+    result = client.table("orders").select("*").eq("parent_order_id", order_id_or_parent_id).eq("shop_id", shop_id).execute()
+    if result.data:
+        return result.data
+    # Fallback to single order ID
+    result = client.table("orders").select("*").eq("id", order_id_or_parent_id).eq("shop_id", shop_id).execute()
+    return result.data or []
 
 
 def get_customer_profile(telegram_user_id: str, shop_id: str) -> Optional[dict]:
@@ -569,4 +588,94 @@ def remove_shop_admin(shop_id: str, telegram_user_id: str) -> bool:
         import logging
         logging.getLogger(__name__).warning(f"Error removing admin '{telegram_user_id}' from '{shop_id}': {e}")
         return False
+
+
+def get_all_products(shop_id: str) -> list[dict]:
+    """Retrieve all products for a specific shop, including inactive ones."""
+    client = get_client()
+    try:
+        res = client.table("products").select("*").eq("shop_id", shop_id).order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching all products for '{shop_id}': {e}")
+        return []
+
+
+def deactivate_product(product_id: str, shop_id: str) -> bool:
+    """Soft-delete a product by setting is_active = false."""
+    client = get_client()
+    try:
+        client.table("products").update({"is_active": False}).eq("id", product_id).eq("shop_id", shop_id).execute()
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error deactivating product '{product_id}': {e}")
+        return False
+
+
+def update_product_name(product_id: str, name: str, shop_id: str) -> bool:
+    """Update a product's name."""
+    client = get_client()
+    try:
+        client.table("products").update({"name": name}).eq("id", product_id).eq("shop_id", shop_id).execute()
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error updating product name for '{product_id}': {e}")
+        return False
+
+
+def update_stock_price(stock_id: str, price: float, shop_id: str) -> bool:
+    """Update stock price with multi-tenant shop isolation check."""
+    client = get_client()
+    try:
+        # Resolve product and verify shop ownership
+        stock_res = client.table("stock").select("product_id").eq("id", stock_id).execute()
+        if not stock_res.data:
+            return False
+        product_id = stock_res.data[0]["product_id"]
+        prod_res = client.table("products").select("id").eq("id", product_id).eq("shop_id", shop_id).execute()
+        if not prod_res.data:
+            return False
+        # Update price
+        client.table("stock").update({"price": price}).eq("id", stock_id).execute()
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error updating stock price for '{stock_id}': {e}")
+        return False
+
+
+def update_stock_quantity(stock_id: str, quantity: int, shop_id: str) -> bool:
+    """Update stock quantity with multi-tenant shop isolation check."""
+    client = get_client()
+    try:
+        # Resolve product and verify shop ownership
+        stock_res = client.table("stock").select("product_id").eq("id", stock_id).execute()
+        if not stock_res.data:
+            return False
+        product_id = stock_res.data[0]["product_id"]
+        prod_res = client.table("products").select("id").eq("id", product_id).eq("shop_id", shop_id).execute()
+        if not prod_res.data:
+            return False
+        # Update quantity
+        client.table("stock").update({"quantity": quantity}).eq("id", stock_id).execute()
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error updating stock quantity for '{stock_id}': {e}")
+        return False
+
+
+def get_recent_orders(shop_id: str, limit: int = 10) -> list[dict]:
+    """Retrieve recent orders for a specific shop."""
+    client = get_client()
+    try:
+        res = client.table("orders").select("*").eq("shop_id", shop_id).order("created_at", desc=True).limit(limit).execute()
+        return res.data or []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error getting recent orders for '{shop_id}': {e}")
+        return []
 
