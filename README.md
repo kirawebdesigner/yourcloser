@@ -1,95 +1,192 @@
-# YourCloser 🤖
+# YourCloser
 
-**The Automated Sales System for Telegram Boutiques**
+Production-ready Telegram sales assistant for boutique shops.
 
-A 24/7 Telegram sales assistant that handles product inquiries, checks real stock, captures orders, and notifies shop owners — so they never miss a sale while sleeping.
+YourCloser lets customers browse products, choose sizes or variants, place orders, and receive order status updates directly inside Telegram. Shop owners manage products, stock, admins, broadcasts, and order actions from the bot admin panel.
 
-## Architecture
+## Current Status
 
+- Customer storefront: browse, search, cart, buy now, checkout, and order tracking.
+- Admin panel: shop switching, add products, product catalog, stock/price editing, recent orders, broadcasts, and admin management.
+- Multi-shop ready: every database call is scoped by `shop_id`.
+- Stock-safe checkout: final checkout uses atomic stock decrement.
+- Production checks: `chaos_test.py` validates callback routing, tenant isolation, checkout locks, and admin recovery.
+
+Latest validation result:
+
+```text
+54/54 tests passed
 ```
-Customer (Telegram) → Bot Handlers → Supabase DB
-                                   ↓
-                          Owner Notification (Telegram)
-```
 
-### Files
+## Tech Stack
+
+| Layer | Tech |
+| --- | --- |
+| Bot | python-telegram-bot v21 |
+| API | FastAPI + Uvicorn |
+| Database | Supabase Postgres |
+| Deployment | Choreo compatible Docker service |
+
+## Important Files
 
 | File | Purpose |
-|------|---------|
-| `main.py` | FastAPI server + entry point (webhook & polling modes) |
-| `handlers.py` | Telegram conversation flow (7-step sales funnel) |
-| `db.py` | All Supabase queries (zero guessing policy) |
-| `config.py` | Environment variable loader |
-| `schema.sql` | Database schema + demo data |
+| --- | --- |
+| `main.py` | FastAPI app, webhook entrypoint, polling mode for local dev |
+| `handlers.py` | Telegram customer, checkout, owner, and admin flows |
+| `db.py` | Supabase queries and tenant-safe DB helpers |
+| `tenant_context.py` | Resolves active `shop_id` from deep links/session |
+| `chaos_test.py` | Production validation suite |
+| `schema.sql` | Base Supabase schema and demo catalog |
+| `migration_v4.sql` to `migration_v8.sql` | Required production migrations |
+| `.choreo/component.yaml` | Choreo REST endpoint configuration |
 
-## Setup
+## Environment Variables
 
-### 1. Create Telegram Bot
+Set these in `.env` for local development and in Choreo environment variables for production:
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot` and follow prompts
-3. Copy the bot token
-
-### 2. Get Your Telegram User ID
-
-1. Message [@userinfobot](https://t.me/userinfobot)
-2. Copy your user ID (this is where order notifications go)
-
-### 3. Setup Supabase
-
-1. Create a project at [supabase.com](https://supabase.com)
-2. Go to SQL Editor → paste `schema.sql` → Run
-3. Copy your project URL and service role key from Settings → API
-
-### 4. Configure Environment
-
-```bash
-cd bot
-copy .env.example .env
-# Edit .env with your actual values
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_OWNER_CHAT_ID=your_telegram_user_id
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_SERVICE_KEY=your_supabase_service_role_key
+WEBHOOK_URL=https://your-public-choreo-url
 ```
 
-### 5. Install & Run
+Notes:
 
-```bash
+- `TELEGRAM_BOT_TOKEN` comes from `@BotFather`.
+- `TELEGRAM_OWNER_CHAT_ID` comes from `@userinfobot`.
+- `SUPABASE_SERVICE_KEY` must be the service role key, not the anon key.
+- Keep `.env` private. It is ignored by Git.
+- For local polling mode, leave `WEBHOOK_URL` empty.
+
+## Supabase Setup
+
+Run these files in the Supabase SQL Editor in this order:
+
+```text
+schema.sql
+migration_v4.sql
+migration_v5.sql
+migration_v6.sql
+migration_v7.sql
+migration_v8.sql
+```
+
+If you also keep `database_fix.sql` from the parent workspace, run it after `migration_v8.sql`.
+
+The current production-ready database state should keep:
+
+- One default test shop: `default`
+- Demo products under `default`
+- No test orders
+- The owner assigned in `shop_admins`
+
+## Local Development
+
+```powershell
+cd C:\Users\kirub\OneDrive\Desktop\Me\EthioCloser\bot
 pip install -r requirements.txt
-
-# Local dev (polling mode — no domain needed):
 python main.py
-
-# Production (webhook mode — needs public URL):
-# Set WEBHOOK_URL in .env first
-uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## Sales Flow
+Local mode uses Telegram polling when `WEBHOOK_URL` is empty.
 
+Run validation:
+
+```powershell
+python -m py_compile main.py handlers.py db.py config.py tenant_context.py chaos_test.py
+python chaos_test.py
 ```
-/start → "What product?" → Search results
-  → Select product → Available sizes shown
-  → Select size → Price displayed, ask name
-  → Enter name → Ask phone
-  → Enter phone → Ask location
-  → Enter location → Order summary + confirm
-  → Confirm → Order saved → Owner notified
+
+## Choreo Deployment
+
+This repo is ready for Choreo deployment from the `main` branch.
+
+1. Push changes to GitHub.
+2. In Choreo, connect the GitHub repo and select this service.
+3. Confirm the endpoint uses port `8000`.
+4. Add the environment variables listed above.
+5. Deploy the latest commit.
+6. Set `WEBHOOK_URL` to the public Choreo service URL.
+7. Redeploy after setting `WEBHOOK_URL` so the bot registers the Telegram webhook.
+
+Health endpoints:
+
+```text
+GET /
+GET /health
+POST /webhook
 ```
+
+## Client Onboarding
+
+To add a first real client:
+
+1. Collect shop name, owner Telegram user ID, support link, delivery text, welcome text, shop emoji, and product list.
+2. In Telegram, run `/create_shop`.
+3. Create the boutique and save the generated `shop_id`.
+4. Run `/admin`.
+5. Select the new shop.
+6. Add the client owner in `Manage Admins`.
+7. Add products with photos, sizes/variants, prices, and quantities.
+8. Place one test order before giving the shop link to the client.
+
+Customer link format:
+
+```text
+https://t.me/YOUR_BOT_USERNAME?start=SHOP_ID
+```
+
+## Manual Button Checklist
+
+Before pitching a client, manually test:
+
+Customer:
+
+- `/start`
+- Trending Now
+- Best Sellers
+- New Drops
+- Under 5,000 ETB
+- Category buttons
+- Search
+- Product navigation
+- Add to Cart
+- Buy Now
+- Checkout
+- Cancel order
+- Track Orders
+
+Admin:
+
+- `/admin`
+- Switch Shop
+- Add Product
+- Publish Product
+- My Products
+- Toggle Status
+- Edit Name
+- Manage Stock
+- Edit Price
+- Edit Quantity
+- Recent Orders
+- Broadcast
+- Manage Admins
+- Revoke Admin
+
+Owner order controls:
+
+- Confirm
+- Reject
+- Mark On Way
+- Mark Delivered
 
 ## Reliability Rules
 
-1. **Bot never guesses stock** — only reports what the DB returns
-2. **Triple stock verification** — checked at search, selection, AND confirmation
-3. **Owner has final word** — confirm/reject buttons on every order notification
-4. **Ethiopian phone validation** — 09xx/07xx/+251xx format enforced
-
-## Production Deployment
-
-For production, you need a public HTTPS URL. Options:
-- **Railway.app** — easiest, free tier available
-- **Render.com** — free tier with auto-sleep
-- **VPS** — any Ubuntu server with nginx + certbot
-
-Set `WEBHOOK_URL` to your public URL and the bot will auto-register the webhook on startup.
-
-## Demo Data
-
-The schema includes a fake sneaker store with 5 products (Nike AF1, Yeezy, Jordan 1, NB 550, Dunk Low) and realistic stock/pricing in ETB. Remove the demo data section from `schema.sql` before going live with a real client.
+- The bot never guesses stock or price.
+- Every product/order/admin query is scoped to `shop_id`.
+- Checkout rechecks stock before order creation.
+- Stock decrement is atomic at the database level.
+- Stale checkout/admin/order buttons are guarded so they cannot trigger the wrong action.
+- Owners/admins receive order controls directly in Telegram.
