@@ -44,7 +44,7 @@ def get_product_by_id(product_id: str, shop_id: str) -> Optional[dict]:
     client = get_client()
     result = (
         client.table("products")
-        .select("id, name, description, image_url, category, shop_id")
+        .select("id, name, description, image_url, category, shop_id, is_active")
         .eq("id", product_id)
         .eq("shop_id", shop_id)
         .single()
@@ -214,7 +214,7 @@ def check_stock(product_id: str, size: str, shop_id: str) -> Optional[dict]:
         client.table("stock")
         .select("id, product_id, size, quantity, price, products!inner(shop_id)")
         .eq("product_id", product_id)
-        .eq("size", size.strip().upper())
+        .ilike("size", size.strip())
         .eq("products.shop_id", shop_id)
         .gt("quantity", 0)
         .execute()
@@ -229,7 +229,7 @@ def get_available_sizes(product_id: str, shop_id: str) -> list[dict]:
     client = get_client()
     result = (
         client.table("stock")
-        .select("size, quantity, price, products!inner(shop_id)")
+        .select("id, size, quantity, price, products!inner(shop_id)")
         .eq("product_id", product_id)
         .eq("products.shop_id", shop_id)
         .gt("quantity", 0)
@@ -237,6 +237,48 @@ def get_available_sizes(product_id: str, shop_id: str) -> list[dict]:
         .execute()
     )
     return result.data
+
+
+def get_stock_rows_for_product(product_id: str, shop_id: str) -> list[dict]:
+    """Get every stock row for a product, including sold-out rows, after verifying shop ownership."""
+    client = get_client()
+    product = get_product_by_id(product_id, shop_id)
+    if not product:
+        return []
+    try:
+        result = (
+            client.table("stock")
+            .select("id, product_id, size, quantity, price")
+            .eq("product_id", product_id)
+            .order("size")
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching stock rows for '{product_id}': {e}")
+        return []
+
+
+def get_stock_row(stock_id: str, shop_id: str) -> Optional[dict]:
+    """Get one stock row after verifying its product belongs to the requested shop."""
+    client = get_client()
+    try:
+        result = (
+            client.table("stock")
+            .select("id, product_id, size, quantity, price")
+            .eq("id", stock_id)
+            .single()
+            .execute()
+        )
+        if not result.data:
+            return None
+        product = get_product_by_id(result.data["product_id"], shop_id)
+        return result.data if product else None
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error fetching stock row '{stock_id}': {e}")
+        return None
 
 
 # NOTE: Old decrement_stock() removed — use decrement_stock_atomic() for race-condition safety
@@ -612,6 +654,30 @@ def deactivate_product(product_id: str, shop_id: str) -> bool:
         import logging
         logging.getLogger(__name__).warning(f"Error deactivating product '{product_id}': {e}")
         return False
+
+
+def toggle_product_active(product_id: str, shop_id: str) -> Optional[bool]:
+    """Toggle product visibility after enforcing the shop boundary. Returns the new active state."""
+    client = get_client()
+    try:
+        product = get_product_by_id(product_id, shop_id)
+        if not product:
+            return None
+        new_status = not bool(product.get("is_active", True))
+        result = (
+            client.table("products")
+            .update({"is_active": new_status})
+            .eq("id", product_id)
+            .eq("shop_id", shop_id)
+            .execute()
+        )
+        if result.data:
+            return new_status
+        return None
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Error toggling product '{product_id}': {e}")
+        return None
 
 
 def update_product_name(product_id: str, name: str, shop_id: str) -> bool:

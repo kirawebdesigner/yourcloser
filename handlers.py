@@ -349,7 +349,15 @@ async def handle_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         title = "⚡ *Under 5,000 ETB*"
 
     if not products:
-        await query.answer("Nothing here yet!", show_alert=True)
+        text = (
+            f"📭 *No products here yet*\n\n"
+            f"This collection is empty right now. Try another collection, search, or come back later."
+        )
+        await safe_edit(
+            query,
+            text,
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="nav_home")]])
+        )
         return
 
     context.user_data.update({"current_list": products, "current_idx": 0, "list_title": title})
@@ -664,7 +672,11 @@ async def show_cart(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     cart = context.user_data.get("cart", [])
     if not cart:
         await query.answer("Your cart is empty!", show_alert=True)
-        await start(query, context) # Fallback to start
+        await safe_edit(
+            query,
+            "🛒 Your cart is empty.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="nav_home")]])
+        )
         return
 
     text = "🛒 *Your Cart*\n\n"
@@ -728,9 +740,12 @@ async def confirm_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "use_profile":
         context.user_data.update(context.user_data["saved_profile"])
         return await show_final_confirmation(query, context)
-    else:
+    if query.data == "new_profile":
         await safe_edit(query, "👤 *What is your full name?*")
         return ENTER_NAME
+
+    await query.answer("Please choose one of the checkout options.", show_alert=True)
+    return CONFIRM_PROFILE
 
 async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     update_activity(context)
@@ -805,6 +820,10 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if query.data == "edit_details":
         await safe_edit(query, "👤 *Let's re-enter your details.*\n\nWhat is your full name?")
         return ENTER_NAME
+
+    if query.data != "confirm_yes":
+        await query.answer("Please use the order confirmation buttons.", show_alert=True)
+        return CONFIRM_ORDER
 
     user = update.effective_user
 
@@ -921,12 +940,19 @@ async def owner_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pass
 
     if "|" in query.data:
-        action_part, shop_id, order_id = query.data.split("|", 2)
+        try:
+            action_part, shop_id, order_id = query.data.split("|", 2)
+        except ValueError:
+            return await query.answer("This order button is no longer valid.", show_alert=True)
         action = action_part.replace("owner_", "", 1)
     else:
         parts = query.data.split("_")
         action, order_id = parts[1], "_".join(parts[2:])
         shop_id = tenant_context.get_shop_id(update, context)
+
+    valid_actions = {"confirm", "reject", "onway", "delivered"}
+    if action not in valid_actions or not order_id:
+        return await query.answer("This order button is no longer valid.", show_alert=True)
 
     # Authorization Check (DB call AFTER query already answered)
     user_id = str(query.from_user.id)
@@ -938,7 +964,13 @@ async def owner_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return await query.answer("⚠️ Shop Owner access only.", show_alert=True)
 
     # Update orders in database
-    db.update_order_status(order_id, "confirmed" if action == "confirm" else "cancelled" if action == "reject" else "on_way" if action == "onway" else "delivered", shop_id)
+    status_by_action = {
+        "confirm": "confirmed",
+        "reject": "cancelled",
+        "onway": "on_way",
+        "delivered": "delivered",
+    }
+    db.update_order_status(order_id, status_by_action[action], shop_id)
 
     # Fetch all orders in the group to get customer info & items
     orders = db.get_orders_by_id_or_group(order_id, shop_id)
@@ -1009,6 +1041,15 @@ async def admin_entry_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(query.from_user.id)
     is_global_owner = user_id == str(settings.TELEGRAM_OWNER_CHAT_ID)
 
+    data = query.data or ""
+
+    if data == "admin_close":
+        await safe_edit(query, "Panel closed.")
+        return ConversationHandler.END
+
+    if data.startswith("admin_shop_"):
+        return await admin_select_shop(update, context)
+
     # Retrieve persistent shop_id from disk cache
     shop_id = get_active_admin_shop_id(context)
     if not shop_id:
@@ -1017,6 +1058,14 @@ async def admin_entry_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Validate authorization (DB call happens AFTER query is already answered)
     if not db.admin_can_manage_shop(user_id, shop_id, allow_global_owner_fallback=True) and not is_global_owner:
         await safe_edit(query, "⚠️ You are not assigned to this boutique.")
+        return ConversationHandler.END
+
+    if not (
+        data.startswith("admin_")
+        or data.startswith("aprod_")
+        or data.startswith("astock_")
+    ):
+        await query.answer("This admin button is no longer active. Open /admin again.", show_alert=True)
         return ConversationHandler.END
 
     # Reroute to admin_home to process the button click
@@ -1198,10 +1247,11 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if query.data.startswith("aprod_toggle|"):
         product_id = query.data.split("|")[1]
-        prod = db.get_product_by_id(product_id, shop_id)
-        if prod:
-            new_status = not prod.get("is_active", True)
-            db.get_client().table("products").update({"is_active": new_status}).eq("id", product_id).execute()
+        new_status = db.toggle_product_active(product_id, shop_id)
+        if new_status is None:
+            await query.answer("Product not found or not assigned to this shop.", show_alert=True)
+            return await render_admin_products_list(query, context, shop_id)
+        else:
             await query.answer(f"Product {'activated' if new_status else 'deactivated'}!", show_alert=True)
         return await render_admin_product_detail(query, context, shop_id, product_id)
 
@@ -1257,13 +1307,16 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer(f"Admin {admin_to_remove} revoked successfully!", show_alert=True)
         return await render_admin_management_panel(query, context, shop_id)
 
+    await query.answer("That admin button is no longer active. Refreshing panel.", show_alert=True)
+    return await render_admin_panel(query, context, shop_id)
+
 async def render_admin_products_list(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
     products = db.get_all_products(shop_id)
     text = f"📋 *Store Catalog for `{shop_id}`*\n\nSelect a product to view details, update stock/pricing, or deactivate:"
     keyboard = []
     
     if not products:
-        text += "\n\n⚠️ No products found in this store."
+        text += "\n\n⚠️ No products found in this store yet. Add the first product to make the shop usable."
     else:
         for p in products:
             status_indicator = "🟢" if p.get("is_active", True) else "🔴"
@@ -1284,7 +1337,7 @@ async def render_admin_product_detail(query, context: ContextTypes.DEFAULT_TYPE,
         await query.answer("Product not found.", show_alert=True)
         return await render_admin_products_list(query, context, shop_id)
 
-    sizes = db.get_available_sizes(product_id, shop_id)
+    sizes = db.get_stock_rows_for_product(product_id, shop_id)
     status_indicator = "🟢 Active (Visible in store)" if prod.get("is_active", True) else "🔴 Inactive (Hidden)"
     
     sizes_text = ""
@@ -1316,12 +1369,12 @@ async def render_admin_product_stock_sizes(query, context: ContextTypes.DEFAULT_
     if not prod:
         return await render_admin_products_list(query, context, shop_id)
         
-    sizes = db.get_available_sizes(product_id, shop_id)
+    sizes = db.get_stock_rows_for_product(product_id, shop_id)
     text = f"⚙️ *Manage Stock & Sizes*\nProduct: *{prod['name']}*\n\nSelect a size configuration to edit price or quantity:"
     keyboard = []
     
     if not sizes:
-        text += "\n\n⚠️ No sizes/stock configurations found."
+        text += "\n\n⚠️ No sizes/stock configurations found. Add this product again with sizes, or create a new product with stock."
     else:
         for s in sizes:
             keyboard.append([
@@ -1333,12 +1386,10 @@ async def render_admin_product_stock_sizes(query, context: ContextTypes.DEFAULT_
     return ADMIN_HOME
 
 async def render_admin_stock_item_options(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str, stock_id: str) -> int:
-    client = db.get_client()
-    res = client.table("stock").select("product_id, size, quantity, price").eq("id", stock_id).execute()
-    if not res.data:
+    stock_item = db.get_stock_row(stock_id, shop_id)
+    if not stock_item:
         await query.answer("Stock record not found.", show_alert=True)
         return ADMIN_HOME
-    stock_item = res.data[0]
     product_id = stock_item["product_id"]
     
     text = (f"⚙️ *Stock Item Options*\n"
@@ -1399,6 +1450,7 @@ async def admin_edit_stock_price(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("⚠️ Invalid price. Please enter a positive number:")
         return ADMIN_EDIT_STOCK_PRICE
         
+    stock_item = db.get_stock_row(stock_id, shop_id)
     success = db.update_stock_price(stock_id, price, shop_id)
     context.user_data.pop("edit_stock_id", None)
     
@@ -1407,8 +1459,12 @@ async def admin_edit_stock_price(update: Update, context: ContextTypes.DEFAULT_T
     else:
         await update.message.reply_text("❌ Failed to update price (unauthorized or item not found).")
         
-    keyboard = [[InlineKeyboardButton("🔙 Back to Catalog", callback_data="admin_my_products")]]
-    await update.message.reply_text("Select Catalog to continue:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = []
+    if stock_item:
+        keyboard.append([InlineKeyboardButton("⚙️ Back to This Stock", callback_data=f"astock_edit_menu|{stock_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Product Stock", callback_data=f"aprod_edit_stock|{stock_item['product_id']}")])
+    keyboard.append([InlineKeyboardButton("📋 Back to Catalog", callback_data="admin_my_products")])
+    await update.message.reply_text("Choose where to continue:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_HOME
 
 async def admin_edit_stock_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1433,6 +1489,7 @@ async def admin_edit_stock_qty(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⚠️ Invalid quantity. Please enter a non-negative integer:")
         return ADMIN_EDIT_STOCK_QTY
         
+    stock_item = db.get_stock_row(stock_id, shop_id)
     success = db.update_stock_quantity(stock_id, qty, shop_id)
     context.user_data.pop("edit_stock_id", None)
     
@@ -1441,8 +1498,12 @@ async def admin_edit_stock_qty(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text("❌ Failed to update quantity (unauthorized or item not found).")
         
-    keyboard = [[InlineKeyboardButton("🔙 Back to Catalog", callback_data="admin_my_products")]]
-    await update.message.reply_text("Select Catalog to continue:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = []
+    if stock_item:
+        keyboard.append([InlineKeyboardButton("⚙️ Back to This Stock", callback_data=f"astock_edit_menu|{stock_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Product Stock", callback_data=f"aprod_edit_stock|{stock_item['product_id']}")])
+    keyboard.append([InlineKeyboardButton("📋 Back to Catalog", callback_data="admin_my_products")])
+    await update.message.reply_text("Choose where to continue:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_HOME
 
 async def render_admin_orders_list(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
@@ -1480,7 +1541,15 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     customers = db.get_all_customers(shop_id)
     if not customers:
-        await update.message.reply_text(f"No customers yet for {shop_id}.")
+        keyboard = [
+            [InlineKeyboardButton("📦 Recent Orders", callback_data="admin_recent_orders")],
+            [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back_home")]
+        ]
+        await update.message.reply_text(
+            f"📭 No customers yet for `{shop_id}`.\n\nBroadcasts become available after this shop receives orders.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return ConversationHandler.END
 
     await update.message.reply_text(f"🚀 Sending to {len(customers)} {shop_id} customers in the background...")
@@ -1800,7 +1869,11 @@ async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE)
         db.add_stock(product_id, s, prod["qty"], prod["price"], shop_id)
 
     text = f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in `{shop_id}` under {prod['category']}."
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Close Admin", callback_data="admin_close")]])
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Another Product", callback_data="admin_add_product")],
+        [InlineKeyboardButton("📋 View Products", callback_data="admin_my_products")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back_home")]
+    ])
 
     if query.message.photo:
         try:
@@ -2023,7 +2096,7 @@ def build_bot_app() -> Application:
     admin_conv = ConversationHandler(
         entry_points=[
             CommandHandler("admin", admin_start),
-            CallbackQueryHandler(admin_entry_callback, pattern=r"^admin_")
+            CallbackQueryHandler(admin_entry_callback, pattern=r"^(admin_|aprod_|astock_)")
         ],
         states={
             ADMIN_SELECT_SHOP: [CallbackQueryHandler(admin_select_shop, pattern=r"^(admin_shop_.*|admin_close)$")],

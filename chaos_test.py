@@ -146,6 +146,9 @@ def test_db_signatures():
         "get_stats",
         "add_product",
         "add_stock",
+        "get_stock_rows_for_product",
+        "get_stock_row",
+        "toggle_product_active",
     ]
 
     for fn_name in must_have_shop_id:
@@ -382,6 +385,99 @@ def test_whitelabel_branding():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 12: Admin callback recovery covers product and stock buttons
+# ═══════════════════════════════════════════════════════════════════
+def test_admin_callback_recovery_patterns():
+    print("\n[TEST 12] Admin Callback Recovery Patterns")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        source = f.read()
+
+    required_patterns = [
+        'pattern=r"^(admin_|aprod_|astock_)"',
+        'data.startswith("aprod_")',
+        'data.startswith("astock_")',
+        'await admin_home(update, context)',
+    ]
+
+    for pattern in required_patterns:
+        if pattern in source:
+            results.ok(f"Recovery source contains: {pattern}")
+        else:
+            results.fail("Admin callback recovery", f"Missing source marker: {pattern}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 13: Admin stock management includes sold-out rows
+# ═══════════════════════════════════════════════════════════════════
+def test_admin_stock_uses_all_rows():
+    print("\n[TEST 13] Admin Stock Management Includes Sold-Out Rows")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        source = f.read()
+
+    if "db.get_stock_rows_for_product(product_id, shop_id)" in source:
+        results.ok("Admin stock/detail views use all stock rows")
+    else:
+        results.fail("Admin stock rows", "Admin views still use available-only stock rows")
+
+    with open("db.py", "r", encoding="utf-8") as f:
+        db_source = f.read()
+
+    helper_block = db_source[db_source.find("def get_stock_rows_for_product"):]
+    helper_block = helper_block.split("def get_stock_row", 1)[0]
+    if ".gt(\"quantity\", 0)" not in helper_block:
+        results.ok("All-stock helper does not filter out zero quantity")
+    else:
+        results.fail("All-stock helper", "Helper still filters quantity > 0")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 14: Product visibility toggles through a tenant-checked helper
+# ═══════════════════════════════════════════════════════════════════
+def test_product_toggle_helper():
+    print("\n[TEST 14] Product Toggle Uses DB Helper")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        source = f.read()
+
+    if "db.toggle_product_active(product_id, shop_id)" in source:
+        results.ok("Handler uses tenant-checked product toggle helper")
+    else:
+        results.fail("Product toggle", "Handler does not call db.toggle_product_active()")
+
+    if 'db.get_client().table("products").update({"is_active": new_status})' not in source:
+        results.ok("Handler no longer updates product status directly")
+    else:
+        results.fail("Product toggle", "Handler still performs direct product status update")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 15: Checkout ignores unrelated callbacks
+# ═══════════════════════════════════════════════════════════════════
+def test_checkout_callback_guard():
+    print("\n[TEST 15] Checkout Callback Guard")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        source = f.read()
+
+    if 'if query.data != "confirm_yes":' in source:
+        results.ok("Confirm order requires explicit confirm_yes callback")
+    else:
+        results.fail("Checkout guard", "Missing explicit confirm_yes guard")
+
+    if 'if query.data == "new_profile":' in source:
+        results.ok("Profile confirmation handles only explicit new_profile callback")
+    else:
+        results.fail("Profile guard", "Missing explicit new_profile branch")
+
+    if 'valid_actions = {"confirm", "reject", "onway", "delivered"}' in source and "status_by_action" in source:
+        results.ok("Owner order actions use explicit action/status mapping")
+    else:
+        results.fail("Owner action guard", "Missing explicit owner action guard/status mapping")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════
 def main():
@@ -400,6 +496,10 @@ def main():
     asyncio.run(test_concurrent_locks())
     test_deep_link_funnel()
     test_whitelabel_branding()
+    test_admin_callback_recovery_patterns()
+    test_admin_stock_uses_all_rows()
+    test_product_toggle_helper()
+    test_checkout_callback_guard()
 
     success = results.summary()
     sys.exit(0 if success else 1)
