@@ -267,7 +267,7 @@ def test_handler_db_calls():
 
     # These MUST exist
     required_calls = [
-        "db.decrement_stock_atomic(",
+        "db.submit_checkout_atomic(",
         "db.get_fulfilled_today_count(",
         "tenant_context.get_shop_id(",
     ]
@@ -277,6 +277,17 @@ def test_handler_db_calls():
             results.ok(f"Required call present: {call}")
         else:
             results.fail(f"Missing call: {call}", "Not found in handlers.py")
+
+    partial_success_markers = [
+        "decrement_result = db.decrement_stock_atomic(",
+        "order = db.create_order(",
+        "continue\n\n            order = db.create_order(",
+    ]
+    for marker in partial_success_markers:
+        if marker in source:
+            results.fail("Atomic checkout", f"Partial-success marker remains: {marker}")
+        else:
+            results.ok(f"Partial-success marker absent: {marker}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -478,6 +489,132 @@ def test_checkout_callback_guard():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 16: Plan definitions match approved ETB packages
+# ═══════════════════════════════════════════════════════════════════
+def test_plan_definitions():
+    print("\n[TEST 16] Plan Definitions & Limits")
+    from plans import PLANS, get_plan
+
+    expected = {
+        "starter": {"monthly_etb": 999, "max_products": 30, "max_admins": 1, "can_broadcast": False},
+        "growth": {"monthly_etb": 2499, "max_products": 150, "max_admins": 1, "can_broadcast": True},
+        "pro": {"monthly_etb": 4999, "max_products": 500, "max_admins": 5, "can_broadcast": True},
+        "custom": {"monthly_etb": None, "max_products": None, "max_admins": None, "can_broadcast": True},
+    }
+
+    for code, checks in expected.items():
+        plan = get_plan(code)
+        failures = []
+        for key, value in checks.items():
+            if getattr(plan, key) != value:
+                failures.append(f"{key}={getattr(plan, key)!r}, expected {value!r}")
+        if failures:
+            results.fail(f"Plan {code}", "; ".join(failures))
+        else:
+            results.ok(f"{PLANS[code].name} plan limits are correct")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 17: Plan gates are wired into admin and onboarding flows
+# ═══════════════════════════════════════════════════════════════════
+def test_plan_gate_wiring():
+    print("\n[TEST 17] Plan Gate Wiring")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        handlers_source = f.read()
+    with open("db.py", "r", encoding="utf-8") as f:
+        db_source = f.read()
+
+    required_handler_markers = [
+        "SHOP_CREATE_PLAN",
+        "SHOP_CREATE_OWNER",
+        "db.can_add_product(shop_id)",
+        'db.require_feature(shop_id, "can_broadcast")',
+        "db.can_add_admin(shop_id)",
+        "PLANS[shop.get('plan', 'starter')].name",
+    ]
+    for marker in required_handler_markers:
+        if marker in handlers_source:
+            results.ok(f"Handler plan marker present: {marker}")
+        else:
+            results.fail("Handler plan wiring", f"Missing marker: {marker}")
+
+    required_db_markers = [
+        "def get_shop_plan",
+        "def can_add_product",
+        "def can_add_admin",
+        "def require_feature",
+        "raise ValueError(reason)",
+        "allow_global_owner_fallback and str(telegram_user_id) == str(settings.TELEGRAM_OWNER_CHAT_ID)",
+    ]
+    for marker in required_db_markers:
+        if marker in db_source:
+            results.ok(f"DB plan marker present: {marker}")
+        else:
+            results.fail("DB plan wiring", f"Missing marker: {marker}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 18: Multi-item checkout is submitted through one atomic RPC
+# ═══════════════════════════════════════════════════════════════════
+def test_atomic_checkout_wiring():
+    print("\n[TEST 18] Atomic Checkout Wiring")
+
+    with open("handlers.py", "r", encoding="utf-8") as f:
+        handlers_source = f.read()
+    with open("db.py", "r", encoding="utf-8") as f:
+        db_source = f.read()
+    with open("migration_v10.sql", "r", encoding="utf-8") as f:
+        migration_source = f.read()
+
+    required_handler_markers = [
+        "created_orders = db.submit_checkout_atomic(",
+        "No items were ordered and no stock was reserved",
+        "context.user_data.pop(\"cart\", None)",
+    ]
+    for marker in required_handler_markers:
+        if marker in handlers_source:
+            results.ok(f"Atomic handler marker present: {marker}")
+        else:
+            results.fail("Atomic handler wiring", f"Missing marker: {marker}")
+
+    failure_block_start = handlers_source.find("except Exception as checkout_err:")
+    failure_block_end = handlers_source.find("success_count = len(created_orders)")
+    failure_block = handlers_source[failure_block_start:failure_block_end]
+    if "context.user_data.pop(\"cart\", None)" not in failure_block:
+        results.ok("Checkout failure path keeps cart available for retry")
+    else:
+        results.fail("Checkout failure path", "Failure path clears cart despite atomic failure")
+
+    required_db_markers = [
+        "def submit_checkout_atomic(",
+        "client.rpc(",
+        "\"submit_checkout_atomic\"",
+        "\"p_items\": items",
+    ]
+    for marker in required_db_markers:
+        if marker in db_source:
+            results.ok(f"Atomic DB marker present: {marker}")
+        else:
+            results.fail("Atomic DB wiring", f"Missing marker: {marker}")
+
+    required_migration_markers = [
+        "CREATE OR REPLACE FUNCTION submit_checkout_atomic",
+        "FOR UPDATE",
+        "GROUP BY (value->>'stock_id')::UUID",
+        "RAISE EXCEPTION 'checkout_stock_unavailable:%'",
+        "UPDATE stock",
+        "INSERT INTO orders",
+        "RETURNS SETOF orders",
+    ]
+    for marker in required_migration_markers:
+        if marker in migration_source:
+            results.ok(f"Atomic migration marker present: {marker}")
+        else:
+            results.fail("Atomic migration", f"Missing marker: {marker}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════
 def main():
@@ -500,6 +637,9 @@ def main():
     test_admin_stock_uses_all_rows()
     test_product_toggle_helper()
     test_checkout_callback_guard()
+    test_plan_definitions()
+    test_plan_gate_wiring()
+    test_atomic_checkout_wiring()
 
     success = results.summary()
     sys.exit(0 if success else 1)

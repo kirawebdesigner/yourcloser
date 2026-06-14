@@ -6,6 +6,7 @@ from supabase import create_client, Client
 from config import settings
 from typing import Optional
 from datetime import datetime, timezone
+from plans import build_plan_record, is_plan_active
 
 
 _client = None
@@ -346,6 +347,46 @@ def create_order(
     return result.data[0] if result.data else {}
 
 
+def submit_checkout_atomic(
+    cart: list[dict],
+    customer_name: str,
+    customer_phone: str,
+    delivery_location: str,
+    telegram_user_id: int,
+    shop_id: str,
+    telegram_username: Optional[str],
+    parent_order_id: str,
+) -> list[dict]:
+    """
+    Submit an entire cart as one database transaction.
+    The Postgres RPC validates all items, locks stock rows, decrements inventory,
+    and inserts all order rows. If any line fails, the entire checkout fails.
+    """
+    client = get_client()
+    items = [
+        {
+            "stock_id": item["stock_id"],
+            "product_id": item["product_id"],
+            "size": item["size"],
+        }
+        for item in cart
+    ]
+    result = client.rpc(
+        "submit_checkout_atomic",
+        {
+            "p_shop_id": shop_id,
+            "p_parent_order_id": parent_order_id,
+            "p_customer_name": customer_name,
+            "p_customer_phone": customer_phone,
+            "p_delivery_location": delivery_location,
+            "p_telegram_user_id": str(telegram_user_id),
+            "p_telegram_username": telegram_username or "",
+            "p_items": items,
+        },
+    ).execute()
+    return result.data or []
+
+
 def update_order_status(order_id_or_parent_id: str, status: str, shop_id: str) -> bool:
     """Update order status for a specific shop by order ID or parent_order_id."""
     client = get_client()
@@ -459,6 +500,76 @@ def get_stats(shop_id: str) -> dict:
     return stats
 
 
+def get_active_product_count(shop_id: str) -> int:
+    """Count active products for plan limit enforcement."""
+    client = get_client()
+    result = (
+        client.table("products")
+        .select("id", count="exact")
+        .eq("shop_id", shop_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return result.count if result.count is not None else (len(result.data) if result.data else 0)
+
+
+def get_admin_count(shop_id: str) -> int:
+    """Count explicitly assigned shop admins. Global owner fallback is not counted."""
+    client = get_client()
+    result = (
+        client.table("shop_admins")
+        .select("telegram_user_id", count="exact")
+        .eq("shop_id", shop_id)
+        .execute()
+    )
+    return result.count if result.count is not None else (len(result.data) if result.data else 0)
+
+
+def get_shop_plan(shop_id: str) -> dict:
+    """Return normalized plan details plus current usage for a shop."""
+    shop = get_shop_details(shop_id)
+    plan = build_plan_record(shop)
+    plan["product_count"] = get_active_product_count(shop_id)
+    plan["admin_count"] = get_admin_count(shop_id)
+    return plan
+
+
+def can_add_product(shop_id: str, additional_count: int = 1) -> tuple[bool, str]:
+    plan = get_shop_plan(shop_id)
+    if not is_plan_active(plan):
+        return False, f"This shop's plan is {plan['status']}. Reactivate billing before adding products."
+    max_products = plan.get("max_products")
+    if max_products is not None and plan["product_count"] + additional_count > int(max_products):
+        return (
+            False,
+            f"{plan['name']} allows up to {max_products} active products. Upgrade the plan or hide older products first.",
+        )
+    return True, ""
+
+
+def can_add_admin(shop_id: str, additional_count: int = 1) -> tuple[bool, str]:
+    plan = get_shop_plan(shop_id)
+    if not is_plan_active(plan):
+        return False, f"This shop's plan is {plan['status']}. Reactivate billing before adding admins."
+    max_admins = plan.get("max_admins")
+    if max_admins is not None and plan["admin_count"] + additional_count > int(max_admins):
+        return (
+            False,
+            f"{plan['name']} includes {max_admins} admin seat(s). Upgrade to Pro for multiple admins.",
+        )
+    return True, ""
+
+
+def require_feature(shop_id: str, feature: str) -> tuple[bool, str]:
+    plan = get_shop_plan(shop_id)
+    if not is_plan_active(plan):
+        return False, f"This shop's plan is {plan['status']}. Reactivate billing to use this feature."
+    allowed = bool(plan.get(feature))
+    if allowed:
+        return True, ""
+    return False, f"{feature.replace('can_', '').replace('_', ' ').title()} is not included in {plan['name']}."
+
+
 def get_admin_shops(telegram_user_id: str, allow_global_owner_fallback: bool = False) -> list[dict]:
     """Return shops this Telegram admin can manage."""
     client = get_client()
@@ -481,7 +592,7 @@ def get_admin_shops(telegram_user_id: str, allow_global_owner_fallback: bool = F
         import logging
         logging.getLogger(__name__).warning(f"Error fetching admin shops for '{telegram_user_id}': {e}")
 
-    if allow_global_owner_fallback:
+    if allow_global_owner_fallback and str(telegram_user_id) == str(settings.TELEGRAM_OWNER_CHAT_ID):
         try:
             shops_res = client.table("shops").select("*").order("name").execute()
             if shops_res.data:
@@ -508,6 +619,8 @@ def upsert_shop(
     delivery_text: Optional[str],
     theme_emoji: str,
     is_verified: bool = False,
+    plan: str = "starter",
+    plan_status: str = "active",
 ) -> dict:
     """Create or update a shop branding profile."""
     client = get_client()
@@ -519,6 +632,8 @@ def upsert_shop(
         "delivery_text": delivery_text,
         "theme_emoji": theme_emoji,
         "is_verified": is_verified,
+        "plan": plan,
+        "plan_status": plan_status,
     }
     result = client.table("shops").upsert(data, on_conflict="id").execute()
     return result.data[0] if result.data else data
@@ -526,6 +641,11 @@ def upsert_shop(
 
 def assign_shop_admin(shop_id: str, telegram_user_id: str, role: str = "owner") -> dict:
     """Grant a Telegram user admin access to a shop."""
+    existing_admins = get_shop_admins(shop_id)
+    if str(telegram_user_id) not in [str(admin_id) for admin_id in existing_admins]:
+        allowed, reason = can_add_admin(shop_id)
+        if not allowed:
+            raise ValueError(reason)
     client = get_client()
     data = {
         "shop_id": shop_id,
@@ -538,6 +658,9 @@ def assign_shop_admin(shop_id: str, telegram_user_id: str, role: str = "owner") 
 
 def add_product(name: str, description: str, category: str, image_url: str, shop_id: str) -> str:
     """Admin function: Create a new product and return its ID."""
+    allowed, reason = can_add_product(shop_id)
+    if not allowed:
+        raise ValueError(reason)
     client = get_client()
     data = {
         "name": name,

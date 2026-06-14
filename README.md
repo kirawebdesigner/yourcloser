@@ -7,15 +7,15 @@ YourCloser lets customers browse products, choose sizes or variants, place order
 ## Current Status
 
 - Customer storefront: browse, search, cart, buy now, checkout, and order tracking.
-- Admin panel: shop switching, add products, product catalog, stock/price editing, recent orders, broadcasts, and admin management.
+- Admin panel: shop switching, add products, product catalog, stock/price editing, recent orders, broadcasts, admin management, and plan limit enforcement.
 - Multi-shop ready: every database call is scoped by `shop_id`.
 - Stock-safe checkout: final checkout uses atomic stock decrement.
-- Production checks: `chaos_test.py` validates callback routing, tenant isolation, checkout locks, and admin recovery.
+- Production checks: `chaos_test.py` validates callback routing, tenant isolation, checkout locks, admin recovery, and plan gates.
 
 Latest validation result:
 
 ```text
-54/54 tests passed
+88/88 tests passed
 ```
 
 ## Tech Stack
@@ -34,10 +34,11 @@ Latest validation result:
 | `main.py` | FastAPI app, webhook entrypoint, polling mode for local dev |
 | `handlers.py` | Telegram customer, checkout, owner, and admin flows |
 | `db.py` | Supabase queries and tenant-safe DB helpers |
+| `plans.py` | Starter, Growth, Pro, and Custom plan definitions |
 | `tenant_context.py` | Resolves active `shop_id` from deep links/session |
 | `chaos_test.py` | Production validation suite |
 | `schema.sql` | Base Supabase schema and demo catalog |
-| `migration_v4.sql` to `migration_v8.sql` | Required production migrations |
+| `migration_v4.sql` to `migration_v10.sql` | Required production migrations |
 | `.choreo/component.yaml` | Choreo REST endpoint configuration |
 
 ## Environment Variables
@@ -71,9 +72,11 @@ migration_v5.sql
 migration_v6.sql
 migration_v7.sql
 migration_v8.sql
+migration_v9.sql
+migration_v10.sql
 ```
 
-If you also keep `database_fix.sql` from the parent workspace, run it after `migration_v8.sql`.
+If you also keep `database_fix.sql` from the parent workspace, run it after `migration_v10.sql`.
 
 The current production-ready database state should keep:
 
@@ -123,14 +126,13 @@ POST /webhook
 
 To add a first real client:
 
-1. Collect shop name, owner Telegram user ID, support link, delivery text, welcome text, shop emoji, and product list.
+1. Collect shop name, selected plan, owner Telegram user ID, support link, delivery text, welcome text, shop emoji, and product list.
 2. In Telegram, run `/create_shop`.
-3. Create the boutique and save the generated `shop_id`.
+3. Create the boutique, choose the plan, add the client owner Telegram ID, and save the generated `shop_id`.
 4. Run `/admin`.
 5. Select the new shop.
-6. Add the client owner in `Manage Admins`.
-7. Add products with photos, sizes/variants, prices, and quantities.
-8. Place one test order before giving the shop link to the client.
+6. Add products with photos, sizes/variants, prices, and quantities.
+7. Place one test order before giving the shop link to the client.
 
 Customer link format:
 
@@ -175,6 +177,13 @@ Admin:
 - Manage Admins
 - Revoke Admin
 
+Plan enforcement:
+
+- Starter blocks the 31st active product, additional admin seats, and broadcasts.
+- Growth blocks the 151st active product and additional admin seats, but allows broadcasts.
+- Pro allows multiple admins, broadcasts, and reporting-oriented admin views.
+- Custom is controlled through `shops.custom_limits`.
+
 Owner order controls:
 
 - Confirm
@@ -187,6 +196,6 @@ Owner order controls:
 - The bot never guesses stock or price.
 - Every product/order/admin query is scoped to `shop_id`.
 - Checkout rechecks stock before order creation.
-- Stock decrement is atomic at the database level.
+- Multi-item checkout is atomic at the database level: either every order line and stock decrement succeeds, or none do.
 - Stale checkout/admin/order buttons are guarded so they cannot trigger the wrong action.
 - Owners/admins receive order controls directly in Telegram.

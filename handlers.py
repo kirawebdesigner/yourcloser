@@ -22,6 +22,7 @@ from telegram.request import HTTPXRequest
 from config import settings
 import db
 import tenant_context
+from plans import PLANS, describe_limit
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ def parse_product_text(text: str) -> dict:
     ADMIN_CONFIRM_PROD,
     ADMIN_INPUT_OWNER_ID,
     SHOP_CREATE_NAME,
+    SHOP_CREATE_PLAN,
+    SHOP_CREATE_OWNER,
     SHOP_CREATE_DELIVERY,
     SHOP_CREATE_SUPPORT,
     SHOP_CREATE_EMOJI,
@@ -164,7 +167,7 @@ def parse_product_text(text: str) -> dict:
     ADMIN_EDIT_PRODUCT_NAME,
     ADMIN_EDIT_STOCK_PRICE,
     ADMIN_EDIT_STOCK_QTY,
-) = range(27)
+) = range(29)
 
 CATEGORY_EMOJIS = {
     "Shoes": "👟",
@@ -854,24 +857,12 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await safe_edit(query, f"⚠️ Oops! {', '.join(out_of_stock)} just sold out while you were checking out.\nPlease clear your cart and try again.")
             return ConversationHandler.END
 
-        total = 0
-        success_count = 0
-        created_orders = []
         import uuid
         parent_order_id = str(uuid.uuid4())
 
-        for i, item in enumerate(cart):
-            # Atomic decrement — if returns None, item sold out between checks
-            decrement_result = db.decrement_stock_atomic(item["stock_id"], shop_id)
-            if not decrement_result:
-                logger.warning(f"Stock conflict (atomic) for {item['product_name']} size {item['size']}")
-                continue
-
-            order = db.create_order(
-                product_id=item["product_id"],
-                product_name=item["product_name"],
-                size=item["size"],
-                price=item["price"],
+        try:
+            created_orders = db.submit_checkout_atomic(
+                cart=cart,
                 customer_name=data["customer_name"],
                 customer_phone=data["customer_phone"],
                 delivery_location=data["delivery_location"],
@@ -880,19 +871,26 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 telegram_username=user.username,
                 parent_order_id=parent_order_id,
             )
+        except Exception as checkout_err:
+            logger.warning(f"Atomic checkout failed for user {user.id} in shop '{shop_id}': {checkout_err}")
+            context.user_data["user_state"] = "browsing"
+            await safe_edit(
+                query,
+                "⚠️ Your order could not be completed because one or more items changed while you were checking out.\n\n"
+                "No items were ordered and no stock was reserved. Please review your cart and try again.",
+            )
+            return ConversationHandler.END
 
-            remaining = decrement_result.get("quantity", "?")
-            logger.info(f"ORDER PLACED: {user.id} bought {item['product_name']} size {item['size']} — Stock remaining: {remaining}")
-
-            total += item["price"]
-            success_count += 1
-            created_orders.append(order)
+        success_count = len(created_orders)
+        total = sum(float(order.get("price", 0)) for order in created_orders)
 
         if success_count > 0:
             await notify_owner_orders_consolidated(context, data, user, created_orders, shop_id, parent_order_id)
             await safe_edit(query, f"🎉 *Order Confirmed!*\n\n{success_count} item(s) for {total:,.0f} ETB.\nThe boutique will contact you shortly! 🙏")
         else:
-            await safe_edit(query, "❌ Your order could not be completed due to stock conflicts.")
+            context.user_data["user_state"] = "browsing"
+            await safe_edit(query, "❌ Your order could not be completed. No items were ordered and no stock was changed.")
+            return ConversationHandler.END
         context.user_data.pop("cart", None)
         context.user_data["user_state"] = "idle"
         return ConversationHandler.END
@@ -1118,13 +1116,19 @@ def get_active_admin_shop_id(context: ContextTypes.DEFAULT_TYPE) -> str | None:
 async def render_admin_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
     """Render the admin command center for the currently selected shop."""
     stats = db.get_stats(shop_id)
+    plan = db.get_shop_plan(shop_id)
     shop_details = db.get_shop_details(shop_id)
     shop_name = shop_details.get("name", "YourCloser")
     emoji = shop_details.get("theme_emoji", "💎")
+    max_products = describe_limit(plan.get("max_products"))
+    max_admins = describe_limit(plan.get("max_admins"))
 
     text = (
         f"{emoji} *{shop_name} Admin Panel*\n"
         f"`Current Shop: {shop_id}`\n\n"
+        f"💼 *Plan:* {plan['name']} ({plan['status']})\n"
+        f"🧾 *Products:* {plan['product_count']}/{max_products}\n"
+        f"👥 *Admins:* {plan['admin_count']}/{max_admins}\n\n"
         f"📦 *Total Orders:* {stats['total_orders']}\n"
         f"⏳ *Pending:* {stats['pending']}\n"
         f"✅ *Confirmed:* {stats['confirmed']}\n"
@@ -1146,9 +1150,11 @@ async def render_admin_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id:
 async def render_admin_management_panel(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
     """Render the admin/owner management screen for the currently selected shop."""
     admins = db.get_shop_admins(shop_id)
+    plan = db.get_shop_plan(shop_id)
     text = (
         f"👥 *Manage Shop Admins*\n"
         f"`Shop: {shop_id}`\n\n"
+        f"Plan: *{plan['name']}* | Seats: *{plan['admin_count']}/{describe_limit(plan.get('max_admins'))}*\n\n"
         f"Admins listed here will receive real-time order alerts for this boutique and can manage its products.\n\n"
         f"👤 *Current Admins:* \n"
     )
@@ -1165,7 +1171,10 @@ async def render_admin_management_panel(query, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton(f"❌ Revoke `{admin_id}`", callback_data=f"admin_revoke_{admin_id}")
         ])
     
-    keyboard.append([InlineKeyboardButton("➕ Add Admin (User ID)", callback_data="admin_add_user")])
+    if plan.get("max_admins") is None or plan["admin_count"] < int(plan["max_admins"]):
+        keyboard.append([InlineKeyboardButton("➕ Add Admin (User ID)", callback_data="admin_add_user")])
+    else:
+        text += "\n🔒 Admin seat limit reached. Upgrade to Pro or Custom to add more admins.\n"
     keyboard.append([InlineKeyboardButton("🔙 Back to Main Panel", callback_data="admin_back_home")])
     
     await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
@@ -1231,9 +1240,17 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     if query.data == "admin_broadcast":
+        allowed, reason = db.require_feature(shop_id, "can_broadcast")
+        if not allowed:
+            await query.answer(reason, show_alert=True)
+            return await render_admin_panel(query, context, shop_id)
         await safe_edit(query, f"📢 *Broadcast Mode*\n\n`Current Shop: {shop_id}`\n\nType your message (or 'cancel'):")
         return ADMIN_BROADCAST
     if query.data == "admin_add_product":
+        allowed, reason = db.can_add_product(shop_id)
+        if not allowed:
+            await query.answer(reason, show_alert=True)
+            return await render_admin_panel(query, context, shop_id)
         await safe_edit(query, f"📸 *Add Product*\n\n`Current Shop: {shop_id}`\n\nSend a clear, high-quality photo of the product:")
         return ADMIN_ADD_PHOTO
 
@@ -1298,6 +1315,10 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return await render_admin_panel(query, context, shop_id)
 
     if query.data == "admin_add_user":
+        allowed, reason = db.can_add_admin(shop_id)
+        if not allowed:
+            await query.answer(reason, show_alert=True)
+            return await render_admin_management_panel(query, context, shop_id)
         await safe_edit(query, "👥 *Add Shop Admin*\n\nPlease enter the new Admin's **Telegram User ID** (a numeric ID like `123456789`):\n\n_To abort this action, type 'cancel'._")
         return ADMIN_INPUT_OWNER_ID
 
@@ -1312,7 +1333,12 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def render_admin_products_list(query, context: ContextTypes.DEFAULT_TYPE, shop_id: str) -> int:
     products = db.get_all_products(shop_id)
-    text = f"📋 *Store Catalog for `{shop_id}`*\n\nSelect a product to view details, update stock/pricing, or deactivate:"
+    plan = db.get_shop_plan(shop_id)
+    text = (
+        f"📋 *Store Catalog for `{shop_id}`*\n"
+        f"Plan: *{plan['name']}* | Active products: *{plan['product_count']}/{describe_limit(plan.get('max_products'))}*\n\n"
+        f"Select a product to view details, update stock/pricing, or deactivate:"
+    )
     keyboard = []
     
     if not products:
@@ -1538,6 +1564,10 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not db.admin_can_manage_shop(str(update.effective_user.id), shop_id, allow_global_owner_fallback=True):
         await update.message.reply_text("You are not assigned to this boutique.")
         return ConversationHandler.END
+    allowed, reason = db.require_feature(shop_id, "can_broadcast")
+    if not allowed:
+        await update.message.reply_text(f"🔒 {reason}")
+        return ConversationHandler.END
 
     customers = db.get_all_customers(shop_id)
     if not customers:
@@ -1592,7 +1622,11 @@ async def admin_input_owner_id(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Select a boutique with /admin before adding admins.")
         return ConversationHandler.END
 
-    db.assign_shop_admin(shop_id, new_admin_id, role="owner")
+    try:
+        db.assign_shop_admin(shop_id, new_admin_id, role="owner")
+    except ValueError as exc:
+        await update.message.reply_text(f"🔒 {exc}")
+        return ConversationHandler.END
     
     admins = db.get_shop_admins(shop_id)
     text = (
@@ -1625,6 +1659,10 @@ async def admin_add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
     if not db.admin_can_manage_shop(str(update.effective_user.id), shop_id, allow_global_owner_fallback=True):
         await update.message.reply_text("You are not assigned to this boutique.")
+        return ConversationHandler.END
+    allowed, reason = db.can_add_product(shop_id)
+    if not allowed:
+        await update.message.reply_text(f"🔒 {reason}")
         return ConversationHandler.END
 
     if not update.message.photo:
@@ -1864,9 +1902,14 @@ async def admin_confirm_prod(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("You are not assigned to this boutique.", show_alert=True)
         return ConversationHandler.END
 
-    product_id = db.add_product(prod["name"], prod["desc"], prod["category"], prod["image_url"], shop_id)
-    for s in prod["sizes"]:
-        db.add_stock(product_id, s, prod["qty"], prod["price"], shop_id)
+    try:
+        product_id = db.add_product(prod["name"], prod["desc"], prod["category"], prod["image_url"], shop_id)
+        for s in prod["sizes"]:
+            db.add_stock(product_id, s, prod["qty"], prod["price"], shop_id)
+    except ValueError as exc:
+        await safe_edit(query, f"🔒 {exc}")
+        context.user_data.pop("admin_new_prod", None)
+        return ConversationHandler.END
 
     text = f"🎉 *Product Added Successfully!*\n\n{prod['name']} is now live in `{shop_id}` under {prod['category']}."
     markup = InlineKeyboardMarkup([
@@ -1915,8 +1958,54 @@ async def create_shop_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "id": shop_id,
         "name": name,
     }
+    keyboard = [
+        [InlineKeyboardButton("Starter — 999 ETB/mo", callback_data="shop_plan_starter")],
+        [InlineKeyboardButton("Growth — 2,499 ETB/mo", callback_data="shop_plan_growth")],
+        [InlineKeyboardButton("Pro — 4,999 ETB/mo", callback_data="shop_plan_pro")],
+        [InlineKeyboardButton("Custom", callback_data="shop_plan_custom")],
+    ]
     await update.message.reply_text(
         f"`shop_id` will be: `{shop_id}`\n\n"
+        "Which plan did this client choose?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SHOP_CREATE_PLAN
+
+
+async def create_shop_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    plan_code = query.data.replace("shop_plan_", "", 1)
+    if plan_code not in PLANS:
+        await query.answer("Choose a valid plan.", show_alert=True)
+        return SHOP_CREATE_PLAN
+
+    plan = PLANS[plan_code]
+    context.user_data["new_shop"]["plan"] = plan_code
+    price = "Contact Sales" if plan.monthly_etb is None else f"{plan.monthly_etb:,.0f} ETB/month"
+    product_limit = describe_limit(plan.max_products)
+    admin_limit = describe_limit(plan.max_admins)
+    await safe_edit(
+        query,
+        f"✅ *{plan.name} selected*\n"
+        f"Price: *{price}*\n"
+        f"Products: *{product_limit}*\n"
+        f"Admins: *{admin_limit}*\n\n"
+        "Now send the client's main owner Telegram user ID.\n"
+        "_Ask them to open @userinfobot and copy the numeric ID._",
+    )
+    return SHOP_CREATE_OWNER
+
+
+async def create_shop_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    owner_id = update.message.text.strip()
+    if not owner_id.isdigit():
+        await update.message.reply_text("Please send a numeric Telegram user ID, for example `123456789`.", parse_mode="Markdown")
+        return SHOP_CREATE_OWNER
+
+    context.user_data["new_shop"]["client_owner_id"] = owner_id
+    await update.message.reply_text(
         "🚚 Delivery text?\n"
         "_Example: Same-day delivery in Addis Ababa: 200 ETB._\n\n"
         "Type `skip` if you do not want to show delivery text.",
@@ -1968,6 +2057,8 @@ async def create_shop_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE
         "📋 *Confirm Boutique Setup*\n\n"
         f"🏪 *Name:* {shop['name']}\n"
         f"🔗 *Shop ID:* `{shop['id']}`\n"
+        f"💼 *Plan:* {PLANS[shop.get('plan', 'starter')].name}\n"
+        f"👤 *Client Owner ID:* `{shop.get('client_owner_id')}`\n"
         f"{shop.get('theme_emoji', '🏪')} *Emoji:* {shop.get('theme_emoji', '🏪')}\n"
         f"🚚 *Delivery:* {shop.get('delivery_text') or 'Not shown'}\n"
         f"💬 *Support:* {shop.get('support_link') or 'Not shown'}\n"
@@ -2008,8 +2099,14 @@ async def create_shop_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         delivery_text=shop.get("delivery_text"),
         theme_emoji=shop.get("theme_emoji", "🏪"),
         is_verified=False,
+        plan=shop.get("plan", "starter"),
+        plan_status="active",
     )
-    db.assign_shop_admin(shop["id"], str(query.from_user.id), "owner")
+    try:
+        db.assign_shop_admin(shop["id"], str(shop["client_owner_id"]), "owner")
+    except ValueError as exc:
+        await safe_edit(query, f"🔒 Boutique created, but owner assignment failed: {exc}\n\nUse /admin to review this shop.")
+        return ConversationHandler.END
     context.user_data["active_admin_shop_id"] = shop["id"]
     context.user_data.pop("new_shop", None)
 
@@ -2020,7 +2117,8 @@ async def create_shop_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🏪 *{shop['name']}*\n"
         f"`shop_id: {shop['id']}`\n\n"
         f"Customer link:\n{store_link}\n\n"
-        "You can now use /admin, select this boutique, and add products."
+        f"Client owner `{shop['client_owner_id']}` can now use /admin after messaging the bot.\n"
+        "Next: add products, place a test order, then send the client the link."
     )
     await safe_edit(query, text)
     return ConversationHandler.END
@@ -2081,6 +2179,8 @@ def build_bot_app() -> Application:
         entry_points=[CommandHandler("create_shop", create_shop_start)],
         states={
             SHOP_CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_name)],
+            SHOP_CREATE_PLAN: [CallbackQueryHandler(create_shop_plan, pattern=r"^shop_plan_")],
+            SHOP_CREATE_OWNER: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_owner)],
             SHOP_CREATE_DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_delivery)],
             SHOP_CREATE_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_support)],
             SHOP_CREATE_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_shop_emoji)],

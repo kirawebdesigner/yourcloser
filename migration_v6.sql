@@ -11,9 +11,31 @@ CREATE TABLE IF NOT EXISTS shops (
     delivery_text TEXT,
     theme_emoji TEXT DEFAULT '💎',
     is_verified BOOLEAN DEFAULT false,
+    plan TEXT NOT NULL DEFAULT 'starter',
+    plan_status TEXT NOT NULL DEFAULT 'active',
+    billing_started_at TIMESTAMPTZ,
+    billing_renews_at TIMESTAMPTZ,
+    custom_limits JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE shops
+DROP CONSTRAINT IF EXISTS shops_plan_check;
+
+ALTER TABLE shops
+ADD CONSTRAINT shops_plan_check
+CHECK (plan IN ('starter', 'growth', 'pro', 'custom'));
+
+ALTER TABLE shops
+DROP CONSTRAINT IF EXISTS shops_plan_status_check;
+
+ALTER TABLE shops
+ADD CONSTRAINT shops_plan_status_check
+CHECK (plan_status IN ('trialing', 'active', 'past_due', 'paused', 'cancelled'));
+
+CREATE INDEX IF NOT EXISTS idx_shops_plan ON shops(plan);
+CREATE INDEX IF NOT EXISTS idx_shops_plan_status ON shops(plan_status);
 
 -- Ensure updated_at trigger is active on shops table
 CREATE OR REPLACE TRIGGER shops_updated_at
